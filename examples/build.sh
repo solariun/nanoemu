@@ -1,10 +1,11 @@
 #!/bin/sh
-# Compile the example sketches for the Arduino Nano and drop .hex/.bin/.elf
-# next to each sketch. Requires: arduino-cli + `arduino-cli core install arduino:avr`.
+# Optional helper: compile the example sketches for the Arduino Nano with
+# arduino-cli (Arduino manages its own toolchain) and drop .hex/.elf/.bin next
+# to each sketch. nanoemu itself does not need any of this.
+# Requires: arduino-cli + `arduino-cli core install arduino:avr`.
 set -e
 cd "$(dirname "$0")"
-OBJCOPY=$(ls -d "$HOME"/Library/Arduino15/packages/arduino/tools/avr-gcc/*/bin/avr-objcopy \
-               "$HOME"/.arduino15/packages/arduino/tools/avr-gcc/*/bin/avr-objcopy 2>/dev/null | head -1)
+command -v arduino-cli >/dev/null || { echo "arduino-cli not found (optional; see README)"; exit 1; }
 for s in */; do
   s=${s%/}
   [ -f "$s/$s.ino" ] || continue
@@ -12,7 +13,7 @@ for s in */; do
   arduino-cli compile --fqbn arduino:avr:nano --output-dir "$out" "$s" >/dev/null
   cp "$out/$s.ino.hex" "$s/$s.hex"
   cp "$out/$s.ino.elf" "$s/$s.elf"
-  if [ -n "$OBJCOPY" ]; then "$OBJCOPY" -I ihex -O binary "$s/$s.hex" "$s/$s.bin"; fi
+  [ -f "$out/$s.ino.bin" ] && cp "$out/$s.ino.bin" "$s/$s.bin"
   rm -rf "$out"
   echo "built examples/$s"
 done

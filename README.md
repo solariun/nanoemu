@@ -86,17 +86,24 @@ screen /dev/ttys004 115200
 - **Interrupts**: INT0/INT1 (level and edge modes), PCINT0..2, watchdog (interrupt or reset), and EEPROM ready.
 - **SPI / TWI**: minimal models. SPI transfers complete instantly and read `0xFF`. TWI is a bus with no devices, so every address gets a NACK and `Wire` fails cleanly.
 
+## Getting firmware
+
+nanoemu has **no compiler or toolchain dependency**. It only runs firmware that is already compiled. You compile with Arduino's own tools, which install and manage their own compiler:
+
+- **Arduino IDE:** choose the board *Arduino Nano*, then *Sketch → Export Compiled Binary*. The `.hex` file appears in the sketch's `build/` folder. Load it with `./nanoemu path/to/sketch.ino.hex`.
+- **arduino-cli:** `arduino-cli compile --fqbn arduino:avr:nano --output-dir out sketch/`, then `./nanoemu out/sketch.ino.hex`.
+
+Use the `.hex` or `.elf` *without* the bootloader. The `*.with_bootloader.hex` file also works, but it boots straight into the sketch.
+
 ## Examples
 
 | Folder | Contents |
 |---|---|
-| `examples/asmtest` | A self-test in plain AVR assembly, with a prebuilt `.hex`. Rebuild it with `avra asmtest.asm`. |
+| `examples/asmtest` | A self-test in plain AVR assembly. A prebuilt `asmtest.hex` is included, so it runs right away. |
 | `examples/demo` | An Arduino sketch: blink, PWM fade on every PWM pin, ADC, an INT0 button counter, an EEPROM boot counter and serial echo. |
 | `examples/blink` | The classic blink plus serial output. |
 
-To build the Arduino examples, run `make examples`. It needs `arduino-cli` and `arduino-cli core install arduino:avr`.
-
-> **Apple Silicon note:** Arduino's avr-gcc is an x86_64 binary, so it needs Rosetta (`softwareupdate --install-rosetta`). The alternative is `brew tap osx-cross/avr && brew install avr-gcc`.
+Compile the two `.ino` sketches as described in [Getting firmware](#getting-firmware). `make examples` is a shortcut that does it with `arduino-cli`.
 
 ## Layout of the code
 
