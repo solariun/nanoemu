@@ -105,6 +105,21 @@ Use the `.hex` or `.elf` *without* the bootloader. The `*.with_bootloader.hex` f
 
 Compile the two `.ino` sketches as described in [Getting firmware](#getting-firmware). `make examples` is a shortcut that does it with `arduino-cli`.
 
+### Native compiler on Apple Silicon (no Rosetta)
+
+On macOS, the avr-gcc that Arduino ships is an x86_64 binary. If you don't want Rosetta, use [arduino-avr-arm64](https://github.com/solariun/arduino-avr-arm64) to build and install a native toolchain for arduino-cli and Arduino IDE 2. Or use the bundled script, which builds from the official GNU and avr-libc sources:
+
+```bash
+tools/build-avr-toolchain.sh        # binutils 2.43 + gcc 14.2 + avr-libc 2.2.1 → ~/.local/avr
+```
+
+The build takes about 20 minutes. When `~/.local/avr/bin/avr-gcc` exists, `make examples` uses it automatically. arduino-cli still provides the Arduino core and libraries. To use the native compiler for your own sketches:
+
+```bash
+arduino-cli compile --fqbn arduino:avr:nano \
+  --build-property compiler.path=$HOME/.local/avr/bin/ --output-dir out mysketch/
+```
+
 ## Layout of the code
 
 `nanoemu.cpp` is split into sections:
