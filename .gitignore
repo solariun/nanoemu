@@ -1,0 +1,5 @@
+/nanoemu
+*.o
+*.obj
+*.eep.hex
+.DS_Store

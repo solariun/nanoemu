@@ -1,0 +1,119 @@
+# nanoemu
+
+An **Arduino Nano (ATmega328P @ 16 MHz) emulator** with a full terminal UI. It's a single C++11 file with no dependencies beyond ncurses.
+
+```
+┌─ CPU ──────────┐┌─ ARDUINO NANO  ATmega328P @ 16 MHz ─────────────────┐┌─ PINS ──────────────┐
+│ PC / SP / SREG ││        50%            25%          RX   TX           ││ D0..D13, A0..A7     │
+│ cycles, time   ││  D12 D11 D10 D9 D8 D7 D6 D5 D4 D3 D2 GND RST RX0 TX1 ││ mode, level, drive, │
+│ real-time rate ││   ○   ○   ○  ●  ○  ○  ●  ○  ○  ○  ○  ■   ■   ●   ●   ││ analog value        │
+├─ REGISTERS ────┤│ USB   L PWR      [ATMEGA328P]        (o)  ICSP      │├─ PERIPHERALS ───────┤
+│ r0..r31, X Y Z ││   ●   ■   ■  ○  ○  ○  ○  ○  ○  ○  ○  ■   ■   ■   ■   ││ T0/T1/T2, UART, ADC │
+├─ CODE ─────────┤│  D13 3V3 REF A0 A1 A2 A3 A4 A5 A6 A7 5V  RST GND VIN ││ EEPROM, WDT, IRQs   │
+│ live disasm    │├─ SERIAL  115200 baud  pty /dev/ttys004 ──────────────┤│                     │
+│                ││ serial console + input line                          ││                     │
+└────────────────┘└──────────────────────────────────────────────────────┘└─────────────────────┘
+┌─ OSCILLOSCOPE  (logic analyzer, freq + duty per channel, trigger) ─────────────────────────────┐
+│ D6  PWM  976.6Hz 25%  ┌┐   ┌┐   ┌┐   ┌┐   ┌┐   ┌┐   ┌┐   ┌┐   ┌┐   ┌┐   ┌┐   ┌┐   ┌┐   ┌┐       │
+│                     ──┘└───┘└───┘└───┘└───┘└───┘└───┘└───┘└───┘└───┘└───┘└───┘└───┘└───       │
+└────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Build
+
+```bash
+make            # macOS: links -lncurses, Linux: -lncursesw -lutil
+```
+
+Or build it directly:
+
+```bash
+c++ -std=c++11 -O2 -o nanoemu nanoemu.cpp -lncurses
+```
+
+## Run
+
+```bash
+./nanoemu examples/asmtest/asmtest.hex
+./nanoemu sketch.ino.bin          # raw flash image
+./nanoemu sketch.ino.elf          # ELF from avr-gcc / arduino-cli
+./nanoemu -p -b 0x1a4 firm.hex    # start paused, breakpoint at byte address 0x1A4
+./nanoemu -H 2 -i "ping" firm.hex # headless: 2 s simulated, serial → stdout (good for CI)
+```
+
+Use a terminal of at least 110×34. 180×50 or larger looks best.
+
+### Keys
+
+| Key | Action |
+|---|---|
+| `SPACE` | run / pause |
+| `s` | single-step one instruction (pauses) |
+| `r` | restart (hard reset, keeps flash and EEPROM) |
+| `l` / `F5` | reload the firmware file from disk and reset |
+| `f` | open another firmware file |
+| `b` | set/clear a breakpoint (hex byte address) |
+| `+` / `-` | simulation speed: x0.001 … x10, or max |
+| `[` / `]` | oscilloscope timebase (1 µs … 100 ms per column) |
+| `t` | toggle the scope trigger (rising edge of the first channel) |
+| `↑` `↓` | select a pin in the PINS panel |
+| `ENTER` | cycle the selected pin's external drive: float → HIGH → LOW |
+| `←` `→` | analog pins: change the ADC voltage. Digital pins: drive LOW/HIGH |
+| `o` | add/remove the selected pin on the oscilloscope |
+| `TAB` | type into the serial port (ENTER sends the line + `\n`, ESC leaves) |
+| `c` | clear the serial console |
+| `q` | quit |
+
+### Virtual serial port
+
+The UART also shows up as a pseudo-terminal. Its path, such as `/dev/ttys004`, is in the SERIAL panel title. You can connect any tool to it:
+
+```bash
+screen /dev/ttys004 115200
+```
+
+## What is emulated
+
+- **CPU**: the full AVRe+ instruction set of the ATmega328P, with cycle counts, interrupts and their latency, the one-instruction delay after `SEI`/`RETI`, `SLEEP`, `BREAK` (it pauses the emulator) and `WDR`.
+- **Memory**: 32 KB flash, 2 KB SRAM, 1 KB EEPROM (with timed writes). EEPROM survives restart and reload.
+- **GPIO**: ports B, C and D, with pull-ups, `PINx` write-to-toggle, external drive from the UI, and the `PUD` bit.
+- **Timers**:
+  - Timer0 and Timer2 (8-bit) and Timer1 (16-bit, with the TEMP register).
+  - All modes: normal, CTC, fast PWM and phase-correct PWM.
+  - Output-compare pins (OC0A/B, OC1A/B, OC2A/B), so `analogWrite()` works on D3, D5, D6, D9, D10 and D11.
+- **USART0**: double-buffered TX with bit-accurate timing. The TX waveform appears on D1, so you can watch it on the scope. Also RX, the UDRE/RX/TX interrupts and U2X.
+- **ADC**: 10-bit, AVCC or 1.1 V reference, ADLAR, free-running mode, plus the bandgap and temperature channels. You set the input voltages from the UI.
+- **Interrupts**: INT0/INT1 (level and edge modes), PCINT0..2, watchdog (interrupt or reset), and EEPROM ready.
+- **SPI / TWI**: minimal models. SPI transfers complete instantly and read `0xFF`. TWI is a bus with no devices, so every address gets a NACK and `Wire` fails cleanly.
+
+## Examples
+
+| Folder | Contents |
+|---|---|
+| `examples/asmtest` | A self-test in plain AVR assembly, with a prebuilt `.hex`. Rebuild it with `avra asmtest.asm`. |
+| `examples/demo` | An Arduino sketch: blink, PWM fade on every PWM pin, ADC, an INT0 button counter, an EEPROM boot counter and serial echo. |
+| `examples/blink` | The classic blink plus serial output. |
+
+To build the Arduino examples, run `make examples`. It needs `arduino-cli` and `arduino-cli core install arduino:avr`.
+
+> **Apple Silicon note:** Arduino's avr-gcc is an x86_64 binary, so it needs Rosetta (`softwareupdate --install-rosetta`). The alternative is `brew tap osx-cross/avr && brew install avr-gcc`.
+
+## Layout of the code
+
+`nanoemu.cpp` is split into sections:
+
+1. **Constants**: I/O register map and pin mapping.
+2. **`class Nano`**: the MCU. It contains:
+   - memory and the firmware loader (bin/hex/elf)
+   - GPIO and pin logging
+   - timers, USART, ADC, EEPROM and TWI
+   - I/O dispatch
+   - the instruction decoder/executor
+   - interrupts
+   - the clock.
+3. **Disassembler**: used by the CODE panel.
+4. **`class App`**: the ncurses UI (board, panels, scope, serial and PTY), the input handling, the real-time pacing loop and headless mode.
+
+## License
+
+MIT
