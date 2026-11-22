@@ -1623,6 +1623,8 @@ public:
     static constexpr double HOLD_GAP = 0.12, RELEASE_MIN = 0.06, RELEASE_MAX = 0.20;
     double s_last = -1, s_gap1 = 1, s_gap2 = 1; // time of the last press, last two gaps
     bool s_hold = false, s_block = false;        // running while held / ignoring repeats after a breakpoint
+    double hold_speed = 0.02; // speed while 's' is held (--hold-speed; 0 = the current speed)
+    double run_speed() const { return s_hold && hold_speed > 0 ? hold_speed : SPEEDS[speed_i]; }
     double release_gap() const { return std::max(RELEASE_MIN, std::min(RELEASE_MAX, 2 * std::max(s_gap1, s_gap2))); }
     int last_row = -1;
     std::string input;
@@ -1995,9 +1997,9 @@ public:
         put(y + 3, x + 1, iw, 0, strf(" CYC  %llu", (unsigned long long)m.cycles));
         put(y + 4, x + 1, iw, 0, strf(" TIME %.6f s", m.cycles / F_CPU));
         put(y + 5, x + 1, iw, 0, strf(" INST %llu", (unsigned long long)m.instrs));
-        double sp = SPEEDS[speed_i];
+        double sp = run_speed();
         put(y + 6, x + 1, iw, 0, strf(" RATE %.2f MHz %s", rate / 1e6, sp ? strf("(x%g)", sp).c_str() : "(max)"));
-        std::string st = m.paused ? "PAUSED" : s_hold ? "RUNNING (s held)" : m.sleeping ? "SLEEP" : "RUNNING";
+        std::string st = m.paused ? "PAUSED" : s_hold ? strf("RUN s held x%g", run_speed()) : m.sleeping ? "SLEEP" : "RUNNING";
         put(y + 7, x + 1, iw, COLOR_PAIR(m.paused ? C_WARN : kp(K_HI, false)) | A_BOLD, " " + st);
         int nbp = bp_count();
         if (nbp) put(y + 7, x + 12, iw - 11, COLOR_PAIR(kp(K_LO, false)), strf("%d breakpoint%s", nbp, nbp > 1 ? "s" : ""));
@@ -2522,7 +2524,7 @@ public:
             double dt = std::min(now - last, 0.1);
             last = now;
             if (!m.paused) {
-                double sp = SPEEDS[speed_i];
+                double sp = run_speed();
                 uint64_t target = sp > 0 ? m.cycles + (uint64_t)(dt * F_CPU * sp) : UINT64_MAX;
                 double deadline = now + 0.03;
                 while (m.cycles < target && !m.paused && mono() < deadline)
@@ -2628,6 +2630,7 @@ static void usage(const char *p) {
             "  -c, --serial run without the TUI, in real time: serial TX to stdout, stdin to serial RX;\n"
             "               stops on Ctrl-C, a breakpoint, or after -H SECONDS\n"
             "  --speed X    with --serial: speed factor (1 = real time, 0 = as fast as possible)\n"
+            "  --hold-speed X  speed while 's' is held down in the TUI (default 0.02; 0 = the current speed)\n"
             "  -H SECONDS   headless: run SECONDS of simulated time as fast as possible, serial to stdout\n"
             "  -i TEXT      (headless/serial) bytes to send to the serial RX line at start\n"
             "  -b WHERE     breakpoint: function | file:line | 0xADDR (repeatable)\n"
@@ -2651,7 +2654,7 @@ int main(int argc, char **argv) {
     std::string inject, file;
     std::vector<std::string> bps, dirs;
     bool start_paused = false, serial_only = false;
-    double speed = 1;
+    double speed = 1, hold_speed = 0.02;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "-H" && i + 1 < argc) hsecs = atof(argv[++i]);
@@ -2661,6 +2664,7 @@ int main(int argc, char **argv) {
         else if (a == "-p") start_paused = true;
         else if (a == "-c" || a == "--serial") serial_only = true;
         else if (a == "--speed" && i + 1 < argc) speed = atof(argv[++i]);
+        else if (a == "--hold-speed" && i + 1 < argc) hold_speed = atof(argv[++i]);
         else if (a == "--ram" && i + 1 < argc) {
             long v = parse_size(argv[++i]);
             if (v < 2048 || v > 0xFF00 || v % 256) { fprintf(stderr, "--ram: 2048 to 65280 bytes, a multiple of 256 (e.g. 4096, 8K)\n"); return 1; }
@@ -2679,6 +2683,7 @@ int main(int argc, char **argv) {
     App &app = *papp;
     app.bp_specs = bps;
     app.src_dirs = dirs;
+    app.hold_speed = hold_speed;
     if (!file.empty() && !app.load(file)) {
         fprintf(stderr, "%s\n", app.msg.c_str());
         return 1;
