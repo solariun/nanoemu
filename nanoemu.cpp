@@ -1617,10 +1617,13 @@ public:
     bool show_source = true;
     bool show_internal = false; // 'a': also show Arduino/toolchain code in the SOURCE panel
     // 's': a tap steps one instruction; holding it runs at the current speed. A terminal sends no key-release,
-    // so holding is seen through the keyboard's auto-repeat: presses closer than HOLD_GAP apart.
-    static constexpr double HOLD_GAP = 0.20, RELEASE_GAP = 0.25;
-    double s_last = -1;
-    bool s_hold = false, s_block = false; // running while held / ignoring repeats after a breakpoint
+    // so holding is seen through the keyboard's auto-repeat, which is fast and regular: two gaps in a row under
+    // HOLD_GAP. Hand tapping rarely does that, so quick taps still step. The release is a pause of twice the
+    // measured repeat interval (bounded), so the run stops soon after the key comes up.
+    static constexpr double HOLD_GAP = 0.12, RELEASE_MIN = 0.06, RELEASE_MAX = 0.20;
+    double s_last = -1, s_gap1 = 1, s_gap2 = 1; // time of the last press, last two gaps
+    bool s_hold = false, s_block = false;        // running while held / ignoring repeats after a breakpoint
+    double release_gap() const { return std::max(RELEASE_MIN, std::min(RELEASE_MAX, 2 * std::max(s_gap1, s_gap2))); }
     int last_row = -1;
     std::string input;
     std::string msg;
@@ -2432,11 +2435,17 @@ public:
         case ' ': m.paused = !m.paused; break;
         case 's': case 'n': {
             double t = mono();
-            bool repeat = s_last >= 0 && t - s_last < HOLD_GAP;
+            s_gap2 = s_gap1;
+            s_gap1 = s_last >= 0 ? t - s_last : 1;
             s_last = t;
-            if (s_block) break;                                   // stopped at a breakpoint: wait for the release
-            if (repeat) { s_hold = true; m.paused = false; break; } // held down: run
-            if (!s_hold) { m.paused = true; m.step(); }             // a tap: one instruction
+            if (s_block) break;                                           // stopped at a breakpoint: wait for the release
+            if (s_hold || (s_gap1 < HOLD_GAP && s_gap2 < HOLD_GAP)) {     // auto-repeat: the key is held down
+                s_hold = true;
+                m.paused = false;
+                break;
+            }
+            m.paused = true;                                              // a tap: one instruction
+            m.step();
             break;
         }
         case 'v': show_source = !show_source; break;
@@ -2520,10 +2529,6 @@ public:
                     m.run_until(std::min(target, m.cycles + 50000));
             }
             if (s_hold && m.paused) { s_hold = false; s_block = true; } // a breakpoint stopped the held run
-            if ((s_hold || s_block) && mono() - s_last > RELEASE_GAP) { // 's' released
-                if (s_hold) m.paused = true;
-                s_hold = s_block = false;
-            }
             if (!m.event.empty()) { set_msg(m.event); m.event.clear(); }
             drain_tx();
             pty_poll();
@@ -2539,6 +2544,11 @@ public:
                 timeout(0);
                 ch = getch();
                 timeout(10);
+            }
+            // after reading every queued key, so repeats waiting in the buffer don't look like a release
+            if ((s_hold || s_block) && mono() - s_last > release_gap()) { // 's' released
+                if (s_hold) m.paused = true;
+                s_hold = s_block = false;
             }
         }
         endwin();
