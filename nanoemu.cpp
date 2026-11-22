@@ -24,7 +24,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <deque>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -40,6 +42,8 @@
 #include <pty.h>
 #endif
 #include <curses.h>
+#include <cxxabi.h>
+#include <sys/stat.h>
 
 // ============================================================================
 //  Constants & helpers
@@ -126,8 +130,9 @@ public:
     uint64_t cycles = 0, instrs = 0;
     bool sleeping = false, irq_inhibit = false;
     bool paused = false;
-    int breakpoint = -1; // word address
     std::string event;   // set when execution stops on its own
+
+    std::vector<uint8_t> bpw; // breakpoint flag per flash word
     uint64_t irq_count[26] = {0};
     int last_irq = 0;
 
@@ -185,6 +190,7 @@ public:
         for (int i = 0; i < FLASH_WORDS; i++) flash[i] = 0xFFFF;
         memset(eeprom, 0xFF, sizeof eeprom);
         for (int i = 0; i < NPINS; i++) { ext[i] = -1; plog[i].resize(PLOG); }
+        bpw.assign(FLASH_WORDS, 0);
         reset(0x01, true);
     }
 
@@ -917,7 +923,7 @@ public:
             int v = irq_pending();
             if (v) { sleeping = false; take_irq(v); tick(slept ? 8 : 4); }
         }
-        if ((int)pc == breakpoint) { paused = true; event = strf("breakpoint at 0x%04X", pc * 2); }
+        if (bpw[pc]) { paused = true; event = strf("breakpoint at 0x%04X", pc * 2); }
     }
 
     void run_until(uint64_t target) {
@@ -981,6 +987,368 @@ public:
 };
 
 // ============================================================================
+//  Debug info: ELF symbols + DWARF (v2..v5) line tables
+// ============================================================================
+
+struct Symbol {
+    uint32_t addr, size; // flash byte address (functions) or data address (objects)
+    std::string name, mangled;
+};
+
+static std::string demangle(const std::string &s) {
+    int st = 0;
+    char *d = abi::__cxa_demangle(s.c_str(), 0, 0, &st);
+    if (st == 0 && d) { std::string r(d); free(d); return r; }
+    return s;
+}
+static std::string base_name(const std::string &p) {
+    size_t k = p.rfind('/');
+    return k == std::string::npos ? p : p.substr(k + 1);
+}
+static std::string dir_name(const std::string &p) {
+    size_t k = p.rfind('/');
+    return k == std::string::npos ? "." : p.substr(0, k);
+}
+static bool file_exists(const std::string &p) {
+    struct stat st;
+    return stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+static std::string short_name(const std::string &d) {
+    size_t k = d.find('(');
+    return k == std::string::npos ? d : d.substr(0, k);
+}
+
+class DebugInfo {
+public:
+    struct Row { uint32_t addr; int file, line; bool end; };
+    std::string elf;
+    std::vector<Symbol> funcs, objs;
+    std::vector<Row> rows;               // sorted by address
+    std::vector<std::string> files;      // global file table
+    std::vector<int32_t> word_row;       // flash word -> row index or -1
+    std::vector<std::string> search;     // extra directories to look for sources
+    std::map<int, std::vector<std::string> > src;
+    std::map<int, std::string> src_path;
+
+    void clear() {
+        elf.clear(); funcs.clear(); objs.clear(); rows.clear(); files.clear();
+        word_row.clear(); src.clear(); src_path.clear(); fidx.clear();
+    }
+    bool loaded() const { return !elf.empty(); }
+    bool has_lines() const { return !rows.empty(); }
+
+    int row_at(uint32_t byteaddr) const {
+        uint32_t w = byteaddr >> 1;
+        return w < word_row.size() ? word_row[w] : -1;
+    }
+    const Symbol *func_at(uint32_t a) const {
+        size_t lo = 0, hi = funcs.size();
+        while (lo < hi) { size_t m = (lo + hi) / 2; if (funcs[m].addr <= a) lo = m + 1; else hi = m; }
+        if (!lo) return 0;
+        const Symbol &s = funcs[lo - 1];
+        return a < s.addr + std::max<uint32_t>(s.size, 2) ? &s : 0;
+    }
+    std::string where(uint32_t a) const {
+        const Symbol *s = func_at(a);
+        if (!s) return "";
+        return a == s->addr ? s->name : strf("%s+0x%X", s->name.c_str(), a - s->addr);
+    }
+    static const Symbol *find_in(const std::vector<Symbol> &v, const std::string &n) {
+        for (size_t i = 0; i < v.size(); i++)
+            if (v[i].name == n || v[i].mangled == n || short_name(v[i].name) == n) return &v[i];
+        return 0;
+    }
+    std::string loc(int r) const {
+        if (r < 0) return "";
+        return strf("%s:%d", base_name(files[rows[r].file]).c_str(), rows[r].line);
+    }
+
+    // source text of a file (cached); null when it can't be found
+    const std::vector<std::string> *source(int f, std::string &path) {
+        if (f < 0 || f >= (int)files.size()) return 0;
+        std::map<int, std::vector<std::string> >::iterator it = src.find(f);
+        if (it == src.end()) {
+            std::vector<std::string> cand(1, files[f]);
+            for (size_t i = 0; i < search.size(); i++) cand.push_back(search[i] + "/" + base_name(files[f]));
+            std::string found;
+            for (size_t i = 0; i < cand.size() && found.empty(); i++) if (file_exists(cand[i])) found = cand[i];
+            std::vector<std::string> lines;
+            if (!found.empty()) {
+                FILE *fp = fopen(found.c_str(), "r");
+                char buf[4096];
+                while (fp && fgets(buf, sizeof buf, fp)) {
+                    std::string l;
+                    for (char *c = buf; *c && *c != '\n' && *c != '\r'; c++) {
+                        if (*c == '\t') l.append(4 - l.size() % 4, ' ');
+                        else l.push_back(*c);
+                    }
+                    lines.push_back(l);
+                }
+                if (fp) fclose(fp);
+            }
+            src_path[f] = found;
+            it = src.insert(std::make_pair(f, lines)).first;
+        }
+        path = src_path[f].empty() ? files[f] : src_path[f];
+        return src_path[f].empty() ? 0 : &it->second;
+    }
+
+    // breakpoint spec: 0xADDR | function | file:line | line (in curfile)
+    bool resolve(const std::string &spec, int curfile, uint32_t &addr, std::string &err) const {
+        if (spec.size() > 2 && spec[0] == '0' && (spec[1] == 'x' || spec[1] == 'X')) {
+            addr = (uint32_t)strtoul(spec.c_str(), 0, 16);
+            return true;
+        }
+        std::string file;
+        int line = -1;
+        size_t colon = spec.rfind(':');
+        bool digits = !spec.empty() && spec.find_first_not_of("0123456789") == std::string::npos;
+        if (digits) line = atoi(spec.c_str());
+        else if (colon != std::string::npos && colon + 1 < spec.size() &&
+                 spec.find_first_not_of("0123456789", colon + 1) == std::string::npos) {
+            file = spec.substr(0, colon);
+            line = atoi(spec.c_str() + colon + 1);
+        }
+        if (line > 0) {
+            if (file.empty() && curfile < 0) { err = "no current source file for line " + spec; return false; }
+            for (int l = line; l < line + 20; l++) {
+                uint32_t best = UINT32_MAX;
+                for (size_t i = 0; i < rows.size(); i++) {
+                    const Row &r = rows[i];
+                    if (r.end || r.line != l) continue;
+                    bool match = file.empty() ? r.file == curfile
+                                              : (files[r.file] == file || base_name(files[r.file]) == base_name(file));
+                    if (match && r.addr < best) best = r.addr;
+                }
+                if (best != UINT32_MAX) { addr = best; return true; }
+            }
+            err = "no code at " + spec;
+            return false;
+        }
+        const Symbol *s = find_in(funcs, spec);
+        if (s) { addr = s->addr; return true; }
+        err = "unknown location: " + spec;
+        return false;
+    }
+
+    bool load(const std::string &path, std::string &err) {
+        clear();
+        std::vector<uint8_t> b;
+        FILE *f = fopen(path.c_str(), "rb");
+        if (!f) { err = strf("cannot open %s", path.c_str()); return false; }
+        uint8_t tmp[65536];
+        size_t n;
+        while ((n = fread(tmp, 1, sizeof tmp, f)) > 0) b.insert(b.end(), tmp, tmp + n);
+        fclose(f);
+        if (b.size() < 52 || memcmp(&b[0], "\x7f" "ELF", 4) || b[4] != 1) { err = "not an ELF32 file"; return false; }
+        auto u16 = [&](size_t o) -> uint32_t { return o + 2 <= b.size() ? (b[o] | b[o + 1] << 8) : 0; };
+        auto u32 = [&](size_t o) -> uint32_t { return u16(o) | u16(o + 2) << 16; };
+        struct Sec { uint32_t name, type, off, size, link; std::string sname; };
+        std::vector<Sec> sec;
+        uint32_t shoff = u32(32), shes = u16(46), shn = u16(48), shstr = u16(50);
+        if (!shes || shoff + (uint64_t)shn * shes > b.size()) { err = "bad ELF section table"; return false; }
+        for (uint32_t i = 0; i < shn; i++) {
+            size_t h = shoff + i * shes;
+            Sec s = {u32(h), u32(h + 4), u32(h + 16), u32(h + 20), u32(h + 24), ""};
+            if ((uint64_t)s.off + s.size > b.size()) s.size = 0;
+            sec.push_back(s);
+        }
+        auto cstr = [&](const Sec *s, uint64_t o) -> std::string {
+            if (!s || o >= s->size) return "";
+            const char *p = (const char *)&b[s->off + o];
+            return std::string(p, strnlen(p, s->size - o));
+        };
+        if (shstr < sec.size())
+            for (size_t i = 0; i < sec.size(); i++) sec[i].sname = cstr(&sec[shstr], sec[i].name);
+        auto find = [&](const char *nm) -> const Sec * {
+            for (size_t i = 0; i < sec.size(); i++) if (sec[i].sname == nm && sec[i].size) return &sec[i];
+            return 0;
+        };
+
+        // symbols
+        for (size_t i = 0; i < sec.size(); i++) {
+            if (sec[i].type != 2 || sec[i].link >= sec.size()) continue; // SHT_SYMTAB
+            const Sec &st = sec[i], &ss = sec[sec[i].link];
+            for (uint32_t o = st.off; o + 16 <= st.off + st.size; o += 16) {
+                uint32_t val = u32(o + 4), sz = u32(o + 8);
+                int type = b[o + 12] & 0xF;
+                std::string nm = cstr(&ss, u32(o));
+                if (nm.empty()) continue;
+                Symbol s = {val, sz, demangle(nm), nm};
+                if (type == 2 && val < 0x800000) funcs.push_back(s);
+                else if (type == 1 && val >= 0x800000 && val < 0x810000) { s.addr = val - 0x800000; objs.push_back(s); }
+            }
+        }
+        std::sort(funcs.begin(), funcs.end(), [](const Symbol &a, const Symbol &c) { return a.addr < c.addr || (a.addr == c.addr && a.size > c.size); });
+        funcs.erase(std::unique(funcs.begin(), funcs.end(), [](const Symbol &a, const Symbol &c) { return a.addr == c.addr; }), funcs.end());
+
+        // line tables
+        const Sec *dl = find(".debug_line");
+        auto blob = [&](const Sec *s) { Blob o = {s ? &b[s->off] : 0, s ? s->size : 0}; return o; };
+        if (dl) parse_lines(&b[dl->off], dl->size, blob(find(".debug_line_str")), blob(find(".debug_str")));
+        std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &c) { return a.addr < c.addr || (a.addr == c.addr && a.end && !c.end); });
+        word_row.assign(FLASH_WORDS, -1);
+        for (size_t i = 0; i < rows.size(); i++) {
+            if (rows[i].end || rows[i].file < 0) continue;
+            uint32_t a1 = i + 1 < rows.size() ? rows[i + 1].addr : rows[i].addr + 2;
+            for (uint32_t a = rows[i].addr; a < a1 && a / 2 < (uint32_t)FLASH_WORDS; a += 2) word_row[a / 2] = (int32_t)i;
+        }
+        elf = path;
+        return true;
+    }
+
+private:
+    std::map<std::string, int> fidx;
+    int file_id(const std::string &p) {
+        std::map<std::string, int>::iterator it = fidx.find(p);
+        if (it != fidx.end()) return it->second;
+        files.push_back(p);
+        return fidx[p] = (int)files.size() - 1;
+    }
+
+    struct Rd {
+        const uint8_t *p, *e;
+        uint8_t u8() { return p < e ? *p++ : (p = e, 0); }
+        uint32_t u16() { uint32_t v = u8(); return v | (uint32_t)u8() << 8; }
+        uint32_t u32() { uint32_t v = u16(); return v | u16() << 16; }
+        uint64_t u64() { uint64_t v = u32(); return v | (uint64_t)u32() << 32; }
+        uint64_t uleb() { uint64_t r = 0; int s = 0; uint8_t c; do { c = u8(); if (s < 64) r |= (uint64_t)(c & 0x7F) << s; s += 7; } while ((c & 0x80) && p < e); return r; }
+        int64_t sleb() { int64_t r = 0; int s = 0; uint8_t c; do { c = u8(); if (s < 64) r |= (int64_t)(c & 0x7F) << s; s += 7; } while ((c & 0x80) && p < e); if (s < 64 && (c & 0x40)) r |= -((int64_t)1 << s); return r; }
+        std::string str() { std::string s; while (p < e && *p) s += (char)*p++; if (p < e) p++; return s; }
+        void skip(uint64_t n) { p = (uint64_t)(e - p) < n ? e : p + n; }
+    };
+
+    struct Blob {
+        const uint8_t *p;
+        uint32_t n;
+        std::string at(uint64_t o) const {
+            if (!p || o >= n) return "";
+            const char *c = (const char *)p + o;
+            return std::string(c, strnlen(c, n - o));
+        }
+    };
+
+    void parse_lines(const uint8_t *data, uint32_t size, Blob lstr, Blob dstr) {
+        Rd all = {data, data + size};
+        while (all.p + 4 <= all.e) {
+            uint64_t len = all.u32();
+            bool off64 = false;
+            if (len == 0xFFFFFFFFu) { len = all.u64(); off64 = true; }
+            if (len > (uint64_t)(all.e - all.p)) break;
+            const uint8_t *end = all.p + len;
+            Rd r = {all.p, end};
+            all.p = end;
+            int ver = r.u16();
+            if (ver < 2 || ver > 5) continue;
+            if (ver >= 5) { r.u8(); r.u8(); }
+            uint64_t hlen = off64 ? r.u64() : r.u32();
+            const uint8_t *prog = r.p + hlen;
+            if (prog > end) continue;
+            int minlen = r.u8();
+            if (ver >= 4) r.u8();
+            bool def_stmt = r.u8();
+            int lbase = (int8_t)r.u8();
+            int lrange = r.u8(), obase = r.u8();
+            if (!lrange) continue;
+            std::vector<int> oplen(obase > 0 ? obase : 1, 0);
+            for (int i = 1; i < obase; i++) oplen[i] = r.u8();
+            std::vector<std::string> dirs;
+            std::vector<int> fmap;
+            auto join = [](const std::string &d, const std::string &f) {
+                return (f.empty() || f[0] == '/' || d.empty()) ? f : d + "/" + f;
+            };
+            if (ver >= 5) {
+                // entry-format driven tables
+                auto table = [&](std::vector<std::pair<std::string, uint64_t> > &out) {
+                    int nf = r.u8();
+                    std::vector<std::pair<uint64_t, uint64_t> > fmt;
+                    for (int i = 0; i < nf; i++) { uint64_t ct = r.uleb(); fmt.push_back(std::make_pair(ct, r.uleb())); }
+                    uint64_t cnt = r.uleb();
+                    for (uint64_t k = 0; k < cnt && r.p < r.e; k++) {
+                        std::string path;
+                        uint64_t dir = 0;
+                        for (size_t j = 0; j < fmt.size(); j++) {
+                            std::string s;
+                            uint64_t num = 0;
+                            switch (fmt[j].second) {
+                            case 0x08: s = r.str(); break;                                                     // string
+                            case 0x1f: s = lstr.at(off64 ? r.u64() : r.u32()); break;                         // line_strp
+                            case 0x0e: s = dstr.at(off64 ? r.u64() : r.u32()); break;                         // strp
+                            case 0x0f: num = r.uleb(); break;
+                            case 0x0b: num = r.u8(); break;
+                            case 0x05: num = r.u16(); break;
+                            case 0x06: num = r.u32(); break;
+                            case 0x07: num = r.u64(); break;
+                            case 0x1e: r.skip(16); break;
+                            case 0x09: r.skip(r.uleb()); break;
+                            default: r.p = r.e; break; // unsupported form: give up on this unit
+                            }
+                            if (fmt[j].first == 1) path = s;
+                            else if (fmt[j].first == 2) dir = num;
+                        }
+                        out.push_back(std::make_pair(path, dir));
+                    }
+                };
+                std::vector<std::pair<std::string, uint64_t> > d5, f5;
+                table(d5);
+                for (size_t i = 0; i < d5.size(); i++) dirs.push_back(d5[i].first);
+                table(f5);
+                for (size_t i = 0; i < f5.size(); i++)
+                    fmap.push_back(file_id(join(f5[i].second < dirs.size() ? dirs[f5[i].second] : "", f5[i].first)));
+            } else {
+                dirs.push_back("");
+                for (;;) { std::string d = r.str(); if (d.empty()) break; dirs.push_back(d); }
+                fmap.push_back(-1);
+                for (;;) {
+                    std::string fn = r.str();
+                    if (fn.empty()) break;
+                    uint64_t di = r.uleb(); r.uleb(); r.uleb();
+                    fmap.push_back(file_id(join(di < dirs.size() ? dirs[di] : "", fn)));
+                }
+            }
+            // line number program
+            r.p = prog;
+            uint64_t addr = 0;
+            int file = 1, line = 1;
+            bool stmt = def_stmt;
+            (void)stmt;
+            auto emit = [&](bool endseq) {
+                int g = (file >= 0 && file < (int)fmap.size()) ? fmap[file] : -1;
+                if (g >= 0 || endseq) { Row w = {(uint32_t)addr, g, line, endseq}; rows.push_back(w); }
+            };
+            while (r.p < r.e) {
+                int op = r.u8();
+                if (op >= obase) {
+                    int adj = op - obase;
+                    addr += (uint64_t)(adj / lrange) * minlen;
+                    line += lbase + adj % lrange;
+                    emit(false);
+                } else if (op == 0) {
+                    uint64_t l = r.uleb();
+                    const uint8_t *next = r.p + l;
+                    if (next > r.e) break;
+                    int sub = l ? r.u8() : 0;
+                    if (sub == 1) { emit(true); addr = 0; file = 1; line = 1; stmt = def_stmt; }
+                    else if (sub == 2) { addr = 0; for (uint64_t k = 0; k + 1 < l && k < 8; k++) addr |= (uint64_t)r.u8() << (8 * k); }
+                    r.p = next;
+                } else switch (op) {
+                    case 1: emit(false); break;
+                    case 2: addr += r.uleb() * minlen; break;
+                    case 3: line += (int)r.sleb(); break;
+                    case 4: file = (int)r.uleb(); break;
+                    case 5: r.uleb(); break;
+                    case 6: stmt = !stmt; break;
+                    case 7: break;
+                    case 8: addr += (uint64_t)((255 - obase) / lrange) * minlen; break;
+                    case 9: addr += r.u16(); break;
+                    default: { for (int k = 0; k < oplen[op]; k++) r.uleb(); } break;
+                }
+            }
+        }
+    }
+};
+
+// ============================================================================
 //  Disassembler
 // ============================================================================
 
@@ -996,7 +1364,12 @@ static std::string io_name(int a) {
     return strf("0x%02X", a - 0x20);
 }
 
-static int disasm(const Nano &m, uint16_t a, std::string &o) {
+static int disasm(const Nano &m, uint16_t a, std::string &o, const DebugInfo *dbg = 0) {
+    auto sym = [&](uint32_t byteaddr) -> std::string {
+        if (!dbg) return "";
+        std::string w = dbg->where(byteaddr);
+        return w.empty() ? "" : " <" + w + ">";
+    };
     uint16_t op = m.flash[a & 0x3FFF], nx = m.flash[(a + 1) & 0x3FFF];
     int d = (op >> 4) & 0x1F, r = (op & 0xF) | ((op >> 5) & 0x10), dh = 16 + ((op >> 4) & 0xF);
     int K = ((op >> 4) & 0xF0) | (op & 0xF);
@@ -1051,7 +1424,7 @@ static int disasm(const Nano &m, uint16_t a, std::string &o) {
             else if (lo == 0xA) o = strf("dec r%d", d);
             else if (lo >= 0xC) {
                 uint32_t k = ((uint32_t)(((op >> 3) & 0x3E) | (op & 1)) << 16) | nx;
-                o = strf("%s 0x%04X", (lo & 2) ? "call" : "jmp", k * 2);
+                o = strf("%s 0x%04X", (lo & 2) ? "call" : "jmp", k * 2) + sym(k * 2);
                 words = 2;
             } else if (lo == 8 && !(op & 0x100)) o = strf("%s%c", (op & 0x80) ? "cl" : "se", fl[(op >> 4) & 7]);
             else switch (op) {
@@ -1080,7 +1453,8 @@ static int disasm(const Nano &m, uint16_t a, std::string &o) {
     }
     case 0xC: case 0xD: {
         int k = (int16_t)(op << 4) >> 4;
-        o = strf("%s 0x%04X", (op >> 12) == 0xC ? "rjmp" : "rcall", ((a + 1 + k) & 0x3FFF) * 2);
+        uint32_t t = ((a + 1 + k) & 0x3FFF) * 2;
+        o = strf("%s 0x%04X", (op >> 12) == 0xC ? "rjmp" : "rcall", t) + ((op >> 12) == 0xD ? sym(t) : std::string());
         break;
     }
     case 0xE: o = K == 0xFF ? strf("ser r%d", dh) : strf("ldi r%d,0x%02X", dh, K); break;
@@ -1125,6 +1499,11 @@ public:
     int sel = 13;
     std::vector<int> scope = {13, 1, 3, 5, 6, 9, 10, 11};
     enum Mode { NORMAL, SERIAL, PROMPT_FILE, PROMPT_BREAK } mode = NORMAL;
+    // debugger
+    DebugInfo dbg;
+    std::vector<std::string> bp_specs, src_dirs;
+    bool show_source = true;
+    int last_row = -1;
     std::string input;
     std::string msg;
     double msg_t = 0;
@@ -1147,8 +1526,83 @@ public:
         m.reset(0x01, true);
         m.paused = false;
         stext.clear();
-        set_msg(strf("loaded %s (%d bytes)", path.c_str(), size));
+        std::string info = load_symbols(path);
+        set_msg(strf("loaded %s (%d bytes)%s", path.c_str(), size, info.c_str()));
         return true;
+    }
+
+    // ------------------------------------------------------------ debugger
+    static bool is_elf(const std::string &p) {
+        FILE *f = fopen(p.c_str(), "rb");
+        char h[4] = {0, 0, 0, 0};
+        if (f) { size_t n = fread(h, 1, 4, f); (void)n; fclose(f); }
+        return !memcmp(h, "\x7f" "ELF", 4);
+    }
+    // symbols/lines from the .elf itself, or from a sibling .elf of a .hex/.bin
+    std::string load_symbols(const std::string &path) {
+        dbg.clear();
+        last_row = -1;
+        std::string ep = path;
+        if (!is_elf(ep)) {
+            size_t dot = path.rfind('.');
+            ep = (dot == std::string::npos ? path : path.substr(0, dot)) + ".elf";
+            if (!file_exists(ep) || !is_elf(ep)) ep.clear();
+        }
+        std::string info;
+        if (!ep.empty()) {
+            std::string err;
+            if (dbg.load(ep, err))
+                info = strf(", %zu symbols, %zu lines%s", dbg.funcs.size() + dbg.objs.size(), dbg.rows.size(),
+                            ep != path ? strf(" from %s", base_name(ep).c_str()).c_str() : "");
+            else info = ", no debug info: " + err;
+        }
+        dbg.search = src_dirs;
+        dbg.search.push_back(dir_name(path));
+        apply_breakpoints();
+        return info;
+    }
+    int cur_file() const {
+        int r = dbg.row_at(m.pc * 2);
+        if (r < 0) r = last_row;
+        return r >= 0 ? dbg.rows[r].file : -1;
+    }
+    std::string apply_breakpoints() {
+        std::fill(m.bpw.begin(), m.bpw.end(), 0);
+        std::string errs;
+        for (size_t i = 0; i < bp_specs.size(); i++) {
+            uint32_t a;
+            std::string e;
+            if (dbg.resolve(bp_specs[i], cur_file(), a, e)) m.bpw[(a / 2) & 0x3FFF] = 1;
+            else errs += (errs.empty() ? "" : "; ") + e;
+        }
+        return errs;
+    }
+    int bp_count() const { int n = 0; for (size_t i = 0; i < m.bpw.size(); i++) n += m.bpw[i]; return n; }
+    void toggle_breakpoint(const std::string &spec) {
+        uint32_t a;
+        std::string e;
+        if (!dbg.resolve(spec, cur_file(), a, e)) { set_msg("breakpoint: " + e); return; }
+        uint16_t w = (a / 2) & 0x3FFF;
+        if (m.bpw[w]) { // remove every spec that lands on this address
+            std::vector<std::string> keep;
+            for (size_t i = 0; i < bp_specs.size(); i++) {
+                uint32_t b2;
+                std::string e2;
+                if (!(dbg.resolve(bp_specs[i], cur_file(), b2, e2) && ((b2 / 2) & 0x3FFF) == w)) keep.push_back(bp_specs[i]);
+            }
+            bp_specs = keep;
+            m.bpw[w] = 0;
+            set_msg(strf("breakpoint removed at 0x%04X", w * 2));
+        } else {
+            // store file:line specs with the file name so they survive a change of current file
+            std::string sp = spec;
+            if (spec.find_first_not_of("0123456789") == std::string::npos && cur_file() >= 0)
+                sp = base_name(dbg.files[cur_file()]) + ":" + spec;
+            bp_specs.push_back(sp);
+            m.bpw[w] = 1;
+            std::string at = dbg.where(w * 2), ln = dbg.loc(dbg.row_at(w * 2));
+            set_msg(strf("breakpoint at 0x%04X %s %s", w * 2, at.c_str(), ln.c_str()));
+        }
     }
     void restart() { m.reset(0x01, true); m.paused = false; set_msg("restarted (hard reset)"); }
 
@@ -1294,6 +1748,75 @@ public:
         }
     }
 
+    // name used in source for a symbol: "loop()::count" -> "count", "count.0" -> "count"
+    static std::string var_key(const std::string &n) {
+        std::string k = n;
+        size_t c = k.rfind("::");
+        if (c != std::string::npos) k = k.substr(c + 2);
+        size_t d = k.find('.');
+        return d == std::string::npos ? k : k.substr(0, d);
+    }
+    std::string var_value(const Symbol &s) {
+        if (s.addr + s.size > (uint32_t)RAM_END || !s.size) return "?";
+        const uint8_t *p = &m.ram[s.addr];
+        if (s.size <= 4 && s.size != 3) {
+            uint32_t v = 0;
+            for (uint32_t i = 0; i < s.size; i++) v |= (uint32_t)p[i] << (8 * i);
+            return strf("%u (0x%X)", v, v);
+        }
+        std::string o = "{";
+        for (uint32_t i = 0; i < s.size && i < 8; i++) o += strf("%s%02X", i ? " " : "", p[i]);
+        return o + (s.size > 8 ? " ...}" : "}");
+    }
+    // globals/statics named on a source line, with their current values
+    std::string line_vars(const std::string &line) {
+        std::string out, seen = " ";
+        for (size_t i = 0; i < line.size();) {
+            if (!(isalpha((unsigned char)line[i]) || line[i] == '_')) { i++; continue; }
+            size_t j = i;
+            while (j < line.size() && (isalnum((unsigned char)line[j]) || line[j] == '_')) j++;
+            std::string id = line.substr(i, j - i);
+            i = j;
+            if (seen.find(" " + id + " ") != std::string::npos) continue;
+            seen += id + " ";
+            for (size_t k = 0; k < dbg.objs.size(); k++)
+                if (var_key(dbg.objs[k].name) == id) {
+                    out += (out.empty() ? "" : "   ") + id + " = " + var_value(dbg.objs[k]);
+                    break;
+                }
+        }
+        return out;
+    }
+
+    void draw_source(int y, int x, int w, int h) {
+        int r = dbg.row_at(m.pc * 2);
+        bool here = r >= 0;
+        if (here) last_row = r; else r = last_row;
+        std::string fn = dbg.where(m.pc * 2);
+        if (r < 0) {
+            box_at(y, x, h, w, "SOURCE");
+            put(y + 1, x + 2, w - 4, COLOR_PAIR(C_DIMTXT), strf("no line info at 0x%04X %s", m.pc * 2, fn.c_str()));
+            return;
+        }
+        const DebugInfo::Row &row = dbg.rows[r];
+        std::string path;
+        const std::vector<std::string> *lines = dbg.source(row.file, path);
+        box_at(y, x, h, w, strf("SOURCE %s:%d%s  %s", base_name(path).c_str(), row.line, here ? "" : " (last line with info)", fn.c_str()));
+        int iw = w - 2, ih = h - 2;
+        if (!lines) { put(y + 1, x + 2, iw - 2, COLOR_PAIR(C_WARN), "source not found: " + path + "  (use -S DIR)"); return; }
+        std::string vars = row.line >= 1 && row.line <= (int)lines->size() ? line_vars((*lines)[row.line - 1]) : "";
+        if (!vars.empty()) ih--;
+        int top = std::max(1, std::min(row.line - ih / 2, (int)lines->size() - ih + 1));
+        for (int i = 0; i < ih; i++) {
+            int ln = top + i;
+            if (ln > (int)lines->size()) break;
+            bool cur = ln == row.line;
+            std::string t = strf("%c%5d  %s", cur ? '>' : ' ', ln, (*lines)[ln - 1].c_str());
+            put(y + 1 + i, x + 1, iw, cur ? (COLOR_PAIR(C_SEL) | A_BOLD) : 0, t + (cur ? std::string(std::max(0, iw - (int)t.size()), ' ') : ""));
+        }
+        if (!vars.empty()) put(y + h - 2, x + 1, iw, COLOR_PAIR(C_WARN) | A_BOLD, " " + vars);
+    }
+
     void draw_serial(int y, int x, int w, int h) {
         std::string t = strf("SERIAL  %.0f baud  TX %llu  RX %llu", (ram_baud()), (unsigned long long)m.us.txn,
                              (unsigned long long)m.us.rxn);
@@ -1337,7 +1860,8 @@ public:
         put(y + 6, x + 1, iw, 0, strf(" RATE %.2f MHz %s", rate / 1e6, sp ? strf("(x%g)", sp).c_str() : "(max)"));
         std::string st = m.paused ? "PAUSED" : m.sleeping ? "SLEEP" : "RUNNING";
         put(y + 7, x + 1, iw, COLOR_PAIR(m.paused ? C_WARN : kp(K_HI, false)) | A_BOLD, " " + st);
-        if (m.breakpoint >= 0) put(y + 7, x + 12, iw - 11, COLOR_PAIR(kp(K_LO, false)), strf("bp 0x%04X", m.breakpoint * 2));
+        int nbp = bp_count();
+        if (nbp) put(y + 7, x + 12, iw - 11, COLOR_PAIR(kp(K_LO, false)), strf("%d breakpoint%s", nbp, nbp > 1 ? "s" : ""));
 
         int ry = y + 9;
         box_at(ry, x, 11, w, "REGISTERS");
@@ -1350,14 +1874,21 @@ public:
 
         int cy = ry + 11, ch = h - 20;
         if (ch < 3) return;
-        box_at(cy, x, ch, w, "CODE");
+        std::string fn = dbg.where(m.pc * 2);
+        box_at(cy, x, ch, w, fn.empty() ? "CODE" : "CODE " + fn);
         uint16_t a = m.pc;
         for (int i = 0; i < ch - 2; i++) {
+            const Symbol *s = dbg.func_at(a * 2);
+            if (s && s->addr == a * 2u && i > 0) { // function label
+                put(cy + 1 + i, x + 1, iw, COLOR_PAIR(C_WARN), " <" + s->name + ">:");
+                if (++i >= ch - 2) break;
+            }
             std::string dis;
-            int n = disasm(m, a, dis);
-            bool cur = (i == 0);
-            std::string line = strf("%s%04X %s", a == m.breakpoint ? "*" : " ", a * 2, dis.c_str());
-            put(cy + 1 + i, x + 1, iw, cur ? (COLOR_PAIR(C_SEL) | A_BOLD) : 0, line + (cur ? std::string(std::max(0, iw - (int)line.size()), ' ') : ""));
+            int n = disasm(m, a, dis, &dbg);
+            bool cur = (a == m.pc);
+            std::string line = strf("%s%04X %s", m.bpw[a] ? "*" : " ", a * 2, dis.c_str());
+            put(cy + 1 + i, x + 1, iw, cur ? (COLOR_PAIR(C_SEL) | A_BOLD) : (m.bpw[a] ? COLOR_PAIR(kp(K_LO, false)) : 0),
+                line + (cur ? std::string(std::max(0, iw - (int)line.size()), ' ') : ""));
             a = (a + n) & 0x3FFF;
         }
     }
@@ -1509,12 +2040,14 @@ public:
         draw_right(1, W - RW, RW, MH);
         int bh = std::min(MH - 5, 14);
         draw_board(1, LW, MW, bh);
-        draw_serial(1 + bh, LW, MW, MH - bh);
+        int srch = (show_source && dbg.has_lines()) ? std::max(5, (MH - bh) / 2) : 0;
+        if (srch) draw_source(1 + bh, LW, MW, srch);
+        draw_serial(1 + bh + srch, LW, MW, MH - bh - srch);
         draw_scope(1 + MH, 0, W, SH);
 
         // key bar
         const char *keys[][2] = {{"SPC", "run/pause"}, {"s", "step"}, {"r", "restart"}, {"l", "reload"}, {"f", "open"},
-                                 {"b", "breakpt"}, {"+-", "speed"}, {"[]", "timebase"}, {"t", "trig"}, {"⏎←→", "drive"},
+                                 {"b", "breakpt"}, {"v", "source"}, {"+-", "speed"}, {"[]", "timebase"}, {"t", "trig"}, {"⏎←→", "drive"},
                                  {"o", "scope"}, {"TAB", "serial"}, {"q", "quit"}};
         int kx = 0;
         move(H - 1, 0);
@@ -1527,7 +2060,8 @@ public:
             if (kx >= W - 4) break;
         }
         if (mode == PROMPT_FILE || mode == PROMPT_BREAK) {
-            std::string p = mode == PROMPT_FILE ? "Open firmware (.bin/.hex/.elf): " : "Breakpoint byte address (hex, empty=clear): ";
+            std::string p = mode == PROMPT_FILE ? "Open firmware (.bin/.hex/.elf): "
+                                                : "Toggle breakpoint (function | file:line | line | 0xADDR; empty = clear all): ";
             attron(COLOR_PAIR(C_WARN) | A_BOLD | A_REVERSE);
             mvhline(H - 1, 0, ' ', W);
             mvaddnstr(H - 1, 1, (p + input + "_").c_str(), W - 2);
@@ -1545,9 +2079,10 @@ public:
                 if (mode == SERIAL) { send_serial(input + "\n"); input.clear(); return; }
                 if (mode == PROMPT_FILE && !input.empty()) load(input);
                 if (mode == PROMPT_BREAK) {
-                    if (input.empty()) { m.breakpoint = -1; set_msg("breakpoint cleared"); }
-                    else { m.breakpoint = (int)(strtol(input.c_str(), 0, 16) / 2) & 0x3FFF; set_msg(strf("breakpoint at 0x%04X", m.breakpoint * 2)); }
+                    if (input.empty()) { bp_specs.clear(); apply_breakpoints(); set_msg("all breakpoints cleared"); }
+                    else toggle_breakpoint(input);
                 }
+
                 mode = NORMAL; input.clear();
                 return;
             }
@@ -1558,6 +2093,7 @@ public:
         case 'q': case 'Q': quit = true; break;
         case ' ': m.paused = !m.paused; break;
         case 's': case 'n': m.paused = true; m.step(); break;
+        case 'v': show_source = !show_source; break;
         case 'r': case 'R': restart(); break;
         case 'l': case 'L': case KEY_F(5): if (!fw_path.empty()) load(fw_path); else set_msg("no firmware loaded, press f"); break;
         case 'f': mode = PROMPT_FILE; input = fw_path; break;
@@ -1683,7 +2219,8 @@ static void usage(const char *p) {
             "usage: %s [options] firmware.{bin,hex,elf}\n"
             "  -H SECONDS   headless: run SECONDS of simulated time, print serial to stdout\n"
             "  -i TEXT      (headless) bytes to send to the serial RX line at start\n"
-            "  -b ADDR      breakpoint at byte address (hex)\n"
+            "  -b WHERE     breakpoint: function | file:line | 0xADDR (repeatable)\n"
+            "  -S DIR       extra directory to search for source files (repeatable)\n"
             "  -p           start paused\n",
             p);
 }
@@ -1697,7 +2234,8 @@ int main(int argc, char **argv) {
         std::string a = argv[i];
         if (a == "-H" && i + 1 < argc) hsecs = atof(argv[++i]);
         else if (a == "-i" && i + 1 < argc) inject = argv[++i];
-        else if (a == "-b" && i + 1 < argc) app.m.breakpoint = (int)(strtol(argv[++i], 0, 16) / 2);
+        else if (a == "-b" && i + 1 < argc) app.bp_specs.push_back(argv[++i]);
+        else if (a == "-S" && i + 1 < argc) app.src_dirs.push_back(argv[++i]);
         else if (a == "-p") start_paused = true;
         else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
         else if (a[0] == '-') { usage(argv[0]); return 1; }
