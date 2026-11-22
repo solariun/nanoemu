@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    name: Build and test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Install ncurses (Linux)
+      if: runner.os == 'Linux'
+      run: sudo apt-get update && sudo apt-get install -y libncurses-dev
+
+    - name: Build
+      run: make CXXFLAGS="-std=c++11 -O2 -Wall -Wextra -Wno-unused-parameter -Werror"
+
+    - name: Assembly self-test (CPU, UART, timers, ADC, interrupts)
+      run: |
+        ./nanoemu -H 1.2 -i "hi" examples/asmtest/asmtest.hex > out.txt 2> stats.txt
+        cat out.txt stats.txt
+        grep -q "mul=1356" out.txt
+        grep -q "ADC0=0200" out.txt
+        grep -q "D6=0(977Hz,25%)" stats.txt
+        grep -q "D9=.(1000Hz,50%)" stats.txt
+
+    - name: Arduino sketch (demo.hex + symbols from demo.elf)
+      run: |
+        ./nanoemu -H 1.2 -i "ping" examples/demo/demo.hex > out.txt 2> stats.txt
+        cat out.txt stats.txt
+        grep -q "nanoemu demo - boot" out.txt
+        grep -q "PING" out.txt
+        grep -q "A0=512" out.txt
+        grep -q "D9=.(490Hz,50%)" stats.txt
+
+    - name: Breakpoint by source line stops the run
+      run: |
+        ./nanoemu -H 2 -b demo.ino:24 examples/demo/demo.elf > out.txt 2> stats.txt || true
+        cat stats.txt
+        grep -q "breakpoint at" stats.txt
