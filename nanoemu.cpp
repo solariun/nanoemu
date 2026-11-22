@@ -52,8 +52,12 @@
 // ============================================================================
 
 static const double F_CPU = 16000000.0;
-static const int FLASH_WORDS = 16384;  // 32 KB
-static const int RAM_END = 0x900;      // regs + IO + 2 KB SRAM
+// Memory sizes: the ATmega328P's by default; --flash / --ram enlarge them for tests (set before Nano is built)
+static int FLASH_WORDS = 16384;        // 32 KB
+static uint32_t PC_MASK = 0x3FFF;      // FLASH_WORDS - 1
+static int RAM_END = 0x900;            // regs + IO + 2 KB SRAM
+static const int RAM_END_328P = 0x900; // the stack top the firmware's startup code sets (RAMEND + 1)
+static const int BOOT_BYTES = 2048;    // the Nano's bootloader section at the top of flash
 static const int EE_SIZE = 1024;
 static const int NPINS = 20;           // D0..D13, A0..A5
 static const uint32_t PLOG = 1u << 17; // pin-toggle history per pin
@@ -125,8 +129,10 @@ static int A_PORT(int p) { return 0x25 + 3 * p; }
 class Nano {
 public:
     // ---- core state ----
-    uint16_t flash[FLASH_WORDS];
-    uint8_t ram[RAM_END];
+    std::vector<uint16_t> flash;
+    std::vector<uint8_t> ram;
+    std::vector<uint8_t> touched;  // per SRAM byte: written at least once since reset
+    uint16_t min_sp = 0xFFFF;      // lowest stack pointer seen since reset (stack peak)
     uint8_t eeprom[EE_SIZE];
     uint16_t pc = 0;
     uint64_t cycles = 0, instrs = 0;
@@ -191,7 +197,9 @@ public:
         Timer t1 = {"T1", true, 0x80, 0x81, 0x84, 0x88, 0x8A, TIMSK1, TIFR1, 0, 1, 0, 2, div01, 0, 1, 0};
         Timer t2 = {"T2", false, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4, TIMSK2, TIFR2, 0, 3, 2, 3, div2, 0, 1, 0};
         tm[0] = t0; tm[1] = t1; tm[2] = t2;
-        for (int i = 0; i < FLASH_WORDS; i++) flash[i] = 0xFFFF;
+        flash.assign(FLASH_WORDS, 0xFFFF);
+        ram.assign(RAM_END, 0);
+        touched.assign(RAM_END, 0);
         memset(eeprom, 0xFF, sizeof eeprom);
         for (int i = 0; i < NPINS; i++) { ext[i] = -1; plog[i].resize(PLOG); }
         bpw.assign(FLASH_WORDS, 0);
@@ -200,8 +208,10 @@ public:
 
     // ------------------------------------------------------------------ reset
     void reset(uint8_t mcusr, bool hard) {
-        memset(ram, 0, sizeof ram);
-        ram[SPL] = 0xFF; ram[SPH] = 0x08;
+        std::fill(ram.begin(), ram.end(), 0);
+        std::fill(touched.begin(), touched.end(), 0);
+        ram[SPL] = (RAM_END - 1) & 0xFF; ram[SPH] = (RAM_END - 1) >> 8;
+        min_sp = RAM_END - 1;
         ram[UCSR0A] = 0x20; ram[UCSR0C] = 0x06;
         ram[TWSR] = 0xF8;
         ram[MCUSR] = mcusr;
@@ -581,6 +591,7 @@ public:
             ram[a] = n; wdt_cnt = 0; return;
         }
         case SPDR: ram[a] = v; ram[SPSR] |= 0x80; return;
+        case SPL: case SPH: ram[a] = v; sp_written(); return;
         case SPSR: ram[a] = (ram[a] & 0xFE) | (v & 1); return;
         case TWCR: twi_write(v); return;
         default: ram[a] = v;
@@ -593,21 +604,29 @@ public:
         return 0;
     }
     inline void wr(uint16_t a, uint8_t v) {
-        if (a < 0x20 || (a >= 0x100 && a < RAM_END)) ram[a] = v;
+        if (a < 0x20) ram[a] = v;
+        else if (a >= 0x100 && a < RAM_END) { ram[a] = v; touched[a] = 1; }
         else if (a < 0x100) io_write(a, v);
     }
 
     // ============================================================ cpu helpers
     uint8_t &SREG() { return ram[SREG_A]; }
     uint16_t sp() const { return ram[SPL] | (ram[SPH] << 8); }
-    void set_sp(uint16_t s) { ram[SPL] = s & 0xFF; ram[SPH] = s >> 8; }
+    void set_sp(uint16_t s) { ram[SPL] = s & 0xFF; ram[SPH] = s >> 8; if (s < min_sp) min_sp = s; }
+    // after a write to SPL/SPH: firmware built for the 328P sets SP to 0x08FF at startup; with --ram,
+    // that becomes the real top so the stack and malloc() can use the extra RAM
+    void sp_written() {
+        uint16_t s = sp();
+        if (RAM_END > RAM_END_328P && s == RAM_END_328P - 1) { s = RAM_END - 1; ram[SPL] = s & 0xFF; ram[SPH] = s >> 8; }
+        if (s < min_sp && s >= 0x100) min_sp = s;
+    }
     void push8(uint8_t v) { uint16_t s = sp(); wr(s, v); set_sp(s - 1); }
     uint8_t pop8() { uint16_t s = sp() + 1; set_sp(s); return rd(s); }
     void push16(uint16_t v) { push8(v & 0xFF); push8(v >> 8); }
     uint16_t pop16() { uint8_t h = pop8(), l = pop8(); return l | (h << 8); }
     uint16_t reg16(int n) const { return ram[n] | (ram[n + 1] << 8); }
     void set_reg16(int n, uint16_t v) { ram[n] = v & 0xFF; ram[n + 1] = v >> 8; }
-    uint8_t lpm(uint16_t z) const { return (flash[(z >> 1) & 0x3FFF] >> ((z & 1) * 8)) & 0xFF; }
+    uint8_t lpm(uint16_t z) const { return (flash[(z >> 1) & PC_MASK] >> ((z & 1) * 8)) & 0xFF; }
     static bool is32(uint16_t op) { return (op & 0xFC0F) == 0x9000 || (op & 0xFE0C) == 0x940C; }
 
     static uint8_t nzs(uint8_t s, uint8_t r) {
@@ -651,14 +670,14 @@ public:
 
     // =========================================================== instruction
     int step_cpu() {
-        uint16_t op = flash[pc & 0x3FFF];
+        uint16_t op = flash[pc & PC_MASK];
         uint16_t npc = pc + 1;
         int cyc = 1;
         int d = (op >> 4) & 0x1F, r = (op & 0xF) | ((op >> 5) & 0x10);
         int dh = 16 + ((op >> 4) & 0xF);
         uint8_t K = ((op >> 4) & 0xF0) | (op & 0xF);
         instrs++;
-#define SKIP() do { int w_ = is32(flash[npc & 0x3FFF]) ? 2 : 1; npc += w_; cyc += w_; } while (0)
+#define SKIP() do { int w_ = is32(flash[npc & PC_MASK]) ? 2 : 1; npc += w_; cyc += w_; } while (0)
         switch (op >> 12) {
         case 0x0:
             switch ((op >> 10) & 3) {
@@ -720,7 +739,7 @@ public:
                 bool st = op & 0x200;
                 cyc = 2;
                 switch (op & 0xF) {
-                case 0x0: { uint16_t a = flash[npc & 0x3FFF]; npc++; if (st) wr(a, ram[d]); else ram[d] = rd(a); break; }
+                case 0x0: { uint16_t a = flash[npc & PC_MASK]; npc++; if (st) wr(a, ram[d]); else ram[d] = rd(a); break; }
                 case 0x1: case 0x2: case 0x9: case 0xA: case 0xC: case 0xD: case 0xE: {
                     int pr = (op & 0xF) >= 0xC ? 26 : (op & 0x8) ? 28 : 30;
                     uint16_t a = reg16(pr);
@@ -764,7 +783,7 @@ public:
                     SREG() = nzs(s, R);
                     ram[d] = R;
                 } else if (lo >= 0xC) {                                                              // JMP/CALL
-                    uint32_t k = ((uint32_t)(((op >> 3) & 0x3E) | (op & 1)) << 16) | flash[npc & 0x3FFF];
+                    uint32_t k = ((uint32_t)(((op >> 3) & 0x3E) | (op & 1)) << 16) | flash[npc & PC_MASK];
                     npc++;
                     if (lo & 2) { push16(npc); cyc = 4; } else cyc = 3;
                     npc = k;
@@ -843,7 +862,7 @@ public:
         }
         }
 #undef SKIP
-        pc = npc & 0x3FFF;
+        pc = npc & PC_MASK;
         return cyc;
     }
 
@@ -1034,6 +1053,9 @@ public:
     std::vector<int32_t> word_row;       // flash word -> row index or -1
     std::vector<uint8_t> user_word;      // flash word -> 1 when its line is in user code
     std::vector<uint8_t> file_user;      // per file: 1 = user code, 0 = Arduino/toolchain internals
+    struct Region { uint32_t start, size; };
+    std::map<std::string, Region> ram_sec; // .data .bss .noinit, as data-space addresses
+    std::map<std::string, uint32_t> marks; // __heap_start, __brkval, ... (data-space addresses)
     std::vector<std::string> search;     // extra directories to look for sources
     std::map<int, std::vector<std::string> > src;
     std::map<int, std::string> src_path;
@@ -1041,6 +1063,7 @@ public:
     void clear() {
         elf.clear(); funcs.clear(); objs.clear(); rows.clear(); files.clear();
         word_row.clear(); user_word.clear(); file_user.clear(); src.clear(); src_path.clear(); fidx.clear();
+        ram_sec.clear(); marks.clear();
     }
     bool loaded() const { return !elf.empty(); }
     bool has_lines() const { return !rows.empty(); }
@@ -1163,14 +1186,14 @@ public:
         if (b.size() < 52 || memcmp(&b[0], "\x7f" "ELF", 4) || b[4] != 1) { err = "not an ELF32 file"; return false; }
         auto u16 = [&](size_t o) -> uint32_t { return o + 2 <= b.size() ? (b[o] | b[o + 1] << 8) : 0; };
         auto u32 = [&](size_t o) -> uint32_t { return u16(o) | u16(o + 2) << 16; };
-        struct Sec { uint32_t name, type, off, size, link; std::string sname; };
+        struct Sec { uint32_t name, type, addr, off, size, link; std::string sname; };
         std::vector<Sec> sec;
         uint32_t shoff = u32(32), shes = u16(46), shn = u16(48), shstr = u16(50);
         if (!shes || shoff + (uint64_t)shn * shes > b.size()) { err = "bad ELF section table"; return false; }
         for (uint32_t i = 0; i < shn; i++) {
             size_t h = shoff + i * shes;
-            Sec s = {u32(h), u32(h + 4), u32(h + 16), u32(h + 20), u32(h + 24), ""};
-            if ((uint64_t)s.off + s.size > b.size()) s.size = 0;
+            Sec s = {u32(h), u32(h + 4), u32(h + 12), u32(h + 16), u32(h + 20), u32(h + 24), ""};
+            if (s.type != 8 && (uint64_t)s.off + s.size > b.size()) s.size = 0; // SHT_NOBITS (.bss) has no file data
             sec.push_back(s);
         }
         auto cstr = [&](const Sec *s, uint64_t o) -> std::string {
@@ -1180,6 +1203,13 @@ public:
         };
         if (shstr < sec.size())
             for (size_t i = 0; i < sec.size(); i++) sec[i].sname = cstr(&sec[shstr], sec[i].name);
+        for (size_t i = 0; i < sec.size(); i++) {
+            const Sec &x = sec[i];
+            if ((x.sname == ".data" || x.sname == ".bss" || x.sname == ".noinit") && x.addr >= 0x800000 && x.addr < 0x810000) {
+                Region r = {x.addr - 0x800000, x.size};
+                ram_sec[x.sname] = r;
+            }
+        }
         auto find = [&](const char *nm) -> const Sec * {
             for (size_t i = 0; i < sec.size(); i++) if (sec[i].sname == nm && sec[i].size) return &sec[i];
             return 0;
@@ -1195,6 +1225,9 @@ public:
                 std::string nm = cstr(&ss, u32(o));
                 if (nm.empty()) continue;
                 Symbol s = {val, sz, demangle(nm), nm};
+                if (val >= 0x800000 && val < 0x810000 && (nm == "__heap_start" || nm == "__brkval" || nm == "__malloc_margin" ||
+                                                          nm == "__malloc_heap_start" || nm == "__malloc_heap_end"))
+                    marks[nm] = val - 0x800000;
                 if (type == 2 && val < 0x800000) funcs.push_back(s);
                 else if (type == 1 && val >= 0x800000 && val < 0x810000) { s.addr = val - 0x800000; objs.push_back(s); }
             }
@@ -1393,7 +1426,7 @@ static int disasm(const Nano &m, uint16_t a, std::string &o, const DebugInfo *db
         std::string w = dbg->where(byteaddr);
         return w.empty() ? "" : " <" + w + ">";
     };
-    uint16_t op = m.flash[a & 0x3FFF], nx = m.flash[(a + 1) & 0x3FFF];
+    uint16_t op = m.flash[a & PC_MASK], nx = m.flash[(a + 1) & PC_MASK];
     int d = (op >> 4) & 0x1F, r = (op & 0xF) | ((op >> 5) & 0x10), dh = 16 + ((op >> 4) & 0xF);
     int K = ((op >> 4) & 0xF0) | (op & 0xF);
     static const char *alu[4][4] = {{"", "cpc", "sbc", "add"}, {"cpse", "cp", "sub", "adc"},
@@ -1476,14 +1509,14 @@ static int disasm(const Nano &m, uint16_t a, std::string &o, const DebugInfo *db
     }
     case 0xC: case 0xD: {
         int k = (int16_t)(op << 4) >> 4;
-        uint32_t t = ((a + 1 + k) & 0x3FFF) * 2;
+        uint32_t t = ((a + 1 + k) & PC_MASK) * 2;
         o = strf("%s 0x%04X", (op >> 12) == 0xC ? "rjmp" : "rcall", t) + ((op >> 12) == 0xD ? sym(t) : std::string());
         break;
     }
     case 0xE: o = K == 0xFF ? strf("ser r%d", dh) : strf("ldi r%d,0x%02X", dh, K); break;
     case 0xF: {
         int s = (op >> 10) & 3, b = op & 7;
-        if (s <= 1) o = strf("%s 0x%04X", brs[s][b], ((a + 1 + ((int8_t)(((op >> 3) & 0x7F) << 1) >> 1)) & 0x3FFF) * 2);
+        if (s <= 1) o = strf("%s 0x%04X", brs[s][b], ((a + 1 + ((int8_t)(((op >> 3) & 0x7F) << 1) >> 1)) & PC_MASK) * 2);
         else if (s == 2) o = strf("%s r%d,%d", (op & 0x200) ? "bst" : "bld", d, b);
         else o = strf("%s r%d,%d", (op & 0x200) ? "sbrs" : "sbrc", d, b);
         break;
@@ -1599,7 +1632,7 @@ public:
         for (size_t i = 0; i < bp_specs.size(); i++) {
             uint32_t a;
             std::string e;
-            if (dbg.resolve(bp_specs[i], cur_file(), a, e)) m.bpw[(a / 2) & 0x3FFF] = 1;
+            if (dbg.resolve(bp_specs[i], cur_file(), a, e)) m.bpw[(a / 2) & PC_MASK] = 1;
             else errs += (errs.empty() ? "" : "; ") + e;
         }
         return errs;
@@ -1609,13 +1642,13 @@ public:
         uint32_t a;
         std::string e;
         if (!dbg.resolve(spec, cur_file(), a, e)) { set_msg("breakpoint: " + e); return; }
-        uint16_t w = (a / 2) & 0x3FFF;
+        uint16_t w = (a / 2) & PC_MASK;
         if (m.bpw[w]) { // remove every spec that lands on this address
             std::vector<std::string> keep;
             for (size_t i = 0; i < bp_specs.size(); i++) {
                 uint32_t b2;
                 std::string e2;
-                if (!(dbg.resolve(bp_specs[i], cur_file(), b2, e2) && ((b2 / 2) & 0x3FFF) == w)) keep.push_back(bp_specs[i]);
+                if (!(dbg.resolve(bp_specs[i], cur_file(), b2, e2) && ((b2 / 2) & PC_MASK) == w)) keep.push_back(bp_specs[i]);
             }
             bp_specs = keep;
             m.bpw[w] = 0;
@@ -1926,14 +1959,130 @@ public:
             std::string line = strf("%s%04X %s", m.bpw[a] ? "*" : " ", a * 2, dis.c_str());
             put(cy + 1 + i, x + 1, iw, cur ? (COLOR_PAIR(C_SEL) | A_BOLD) : (m.bpw[a] ? COLOR_PAIR(kp(K_LO, false)) : 0),
                 line + (cur ? std::string(std::max(0, iw - (int)line.size()), ' ') : ""));
-            a = (a + n) & 0x3FFF;
+            a = (a + n) & PC_MASK;
+        }
+    }
+
+    // ------------------------------------------------------------ memory
+    enum { M_FREE, M_PEAK, M_DATA, M_BSS, M_HEAP, M_STACK };
+    struct MemInfo {
+        int sram, data, bss, heap, stack, peak, used, avail;
+        uint32_t data_lo, data_hi, bss_lo, bss_hi, heap_lo, heap_hi, sp;
+        bool symbols;
+    };
+    MemInfo mem_info() const {
+        MemInfo r;
+        memset(&r, 0, sizeof r);
+        r.sram = RAM_END - 0x100;
+        r.sp = m.sp();
+        r.stack = r.sp < (uint32_t)RAM_END ? (RAM_END - 1) - (int)r.sp : 0;
+        r.peak = (RAM_END - 1) - m.min_sp;
+        std::map<std::string, DebugInfo::Region>::const_iterator d = dbg.ram_sec.find(".data"),
+            b = dbg.ram_sec.find(".bss"), n = dbg.ram_sec.find(".noinit");
+        r.symbols = d != dbg.ram_sec.end() || b != dbg.ram_sec.end();
+        if (r.symbols) {
+            if (d != dbg.ram_sec.end()) { r.data_lo = d->second.start; r.data_hi = d->second.start + d->second.size; }
+            r.bss_lo = r.bss_hi = r.data_hi;
+            if (b != dbg.ram_sec.end()) { r.bss_lo = b->second.start; r.bss_hi = b->second.start + b->second.size; }
+            if (n != dbg.ram_sec.end()) r.bss_hi = std::max(r.bss_hi, n->second.start + n->second.size); // .noinit counted with .bss
+            std::map<std::string, uint32_t>::const_iterator hs = dbg.marks.find("__heap_start"), bv = dbg.marks.find("__brkval");
+            r.heap_lo = hs != dbg.marks.end() ? hs->second : r.bss_hi;
+            uint32_t brk = (bv != dbg.marks.end() && bv->second + 1 < (uint32_t)RAM_END) ? (m.ram[bv->second] | m.ram[bv->second + 1] << 8) : 0;
+            r.heap_hi = brk > r.heap_lo && brk < (uint32_t)RAM_END ? brk : r.heap_lo; // __brkval is 0 until the first malloc()
+            r.data = r.data_hi - r.data_lo;
+            r.bss = r.bss_hi - r.bss_lo;
+            r.heap = r.heap_hi - r.heap_lo;
+            r.used = r.data + r.bss + r.heap + r.stack;
+            r.avail = r.sp + 1 > r.heap_hi ? (int)(r.sp + 1 - r.heap_hi) : 0; // gap between the heap and the stack
+        } else {
+            int used = 0;
+            for (int a = 0x100; a < RAM_END; a++) used += (m.touched[a] || (uint32_t)a > r.sp);
+            r.used = used;
+            r.avail = r.sram - used;
+        }
+        return r;
+    }
+    int mem_class(uint32_t a, const MemInfo &mi) const {
+        if (a > mi.sp) return M_STACK;
+        if (mi.symbols) {
+            if (a >= mi.data_lo && a < mi.data_hi) return M_DATA;
+            if (a >= mi.bss_lo && a < mi.bss_hi) return M_BSS;
+            if (a >= mi.heap_lo && a < mi.heap_hi) return M_HEAP;
+        } else if (m.touched[a]) return M_DATA;
+        return a > m.min_sp ? M_PEAK : M_FREE;
+    }
+    static std::string kb(int bytes) { return bytes >= 1024 && bytes % 1024 == 0 ? strf("%dK", bytes / 1024) : strf("%d", bytes); }
+
+    int memory_height() const { return 10; }
+    void draw_memory(int y, int x, int w, int h) {
+        bool test = RAM_END != RAM_END_328P || FLASH_WORDS != 16384;
+        int iw = w - 2, row = y + 1, last = y + h - 2;
+        // block map of the SRAM, lowest address top-left; each cell is a few bytes
+        const int cols = std::min(32, iw - 2);
+        int rows = 2;
+        int sram = RAM_END - 0x100, bpc = (sram + cols * rows - 1) / (cols * rows);
+        box_at(y, x, h, w, test ? strf("MEMORY  test RAM %s ROM %s  %dB/cell", kb(sram).c_str(), kb(FLASH_WORDS * 2).c_str(), bpc)
+                                : strf("MEMORY  %dB/cell", bpc));
+        MemInfo mi = mem_info();
+        put(row++, x + 1, iw, A_BOLD, strf(" RAM %d B used %d free %d %d%%", mi.sram, mi.used, mi.avail,
+                                           mi.sram ? (int)lround(100.0 * mi.used / mi.sram) : 0));
+        static const int kcol[6] = {K_DIM, K_LO, K_INHI, K_IN, K_PWM, K_LO};
+        for (int r = 0; r < rows && row <= last; r++, row++) {
+            for (int c = 0; c < cols; c++) {
+                uint32_t a0 = 0x100 + (uint32_t)(r * cols + c) * bpc;
+                if (a0 >= (uint32_t)RAM_END) break;
+                int cls = M_FREE;
+                for (uint32_t a = a0; a < a0 + bpc && a < (uint32_t)RAM_END; a++) cls = std::max(cls, mem_class(a, mi));
+                const char *g = cls == M_FREE ? "\u00B7" : cls == M_PEAK ? "\u2592" : "\u2588";
+                int attr = COLOR_PAIR(kp(kcol[cls], false)) | (cls == M_FREE || cls == M_PEAK ? A_DIM : A_BOLD);
+                uput(row, x + 2 + c, attr, g);
+            }
+        }
+        if (row <= last) { // legend
+            int lx = x + 2;
+            const struct { int cls; const char *g, *t; } lg[] = {{M_DATA, "\u2588", mi.symbols ? "data" : "used"}, {M_BSS, "\u2588", "bss"},
+                {M_HEAP, "\u2588", "heap"}, {M_STACK, "\u2588", "stack"}, {M_PEAK, "\u2592", "peak"}, {M_FREE, "\u00B7", "free"}};
+            for (int i = 0; i < 6; i++) {
+                if (!mi.symbols && (lg[i].cls == M_BSS || lg[i].cls == M_HEAP)) continue;
+                uput(row, lx, COLOR_PAIR(kp(kcol[lg[i].cls], false)) | A_BOLD, lg[i].g);
+                put(row, lx + 1, 6, COLOR_PAIR(C_DIMTXT), lg[i].t);
+                lx += 2 + strlen(lg[i].t);
+            }
+            row++;
+        }
+        if (row <= last)
+            put(row++, x + 1, iw, COLOR_PAIR(C_DIMTXT), mi.symbols
+                ? strf(" stack %d (peak %d)  heap %d", mi.stack, mi.peak, mi.heap)
+                : strf(" stack %d (peak %d)  no .elf", mi.stack, mi.peak));
+        // flash
+        int total = FLASH_WORDS * 2, maxsk = total - BOOT_BYTES;
+        if (row <= last)
+            put(row++, x + 1, iw, A_BOLD, strf(" ROM %d/%d B %d%%  boot %s", fw_size, maxsk,
+                                               (int)lround(100.0 * fw_size / maxsk), kb(BOOT_BYTES).c_str()));
+        if (row <= last) {
+            for (int c = 0; c < cols; c++) {
+                int a0 = (int)((int64_t)c * total / cols), a1 = (int)((int64_t)(c + 1) * total / cols);
+                bool boot = a0 >= maxsk, used = a0 < fw_size;
+                const char *g = boot ? "\u2593" : used ? "\u2588" : "\u00B7";
+                int attr = boot ? (COLOR_PAIR(kp(K_DIM, false)) | A_DIM) : used ? (COLOR_PAIR(kp(K_HI, false)) | A_BOLD)
+                                                                          : (COLOR_PAIR(kp(K_DIM, false)) | A_DIM);
+                (void)a1;
+                uput(row, x + 2 + c, attr, g);
+            }
+            row++;
+        }
+        if (row <= last) {
+            int eu = 0;
+            for (int i = 0; i < EE_SIZE; i++) eu += m.eeprom[i] != 0xFF;
+            put(row++, x + 1, iw, COLOR_PAIR(C_DIMTXT), strf(" EEPROM %d/%d B used  writes %u", eu, EE_SIZE, m.ee_writes));
         }
     }
 
     void draw_right(int y, int x, int w, int h) {
         int iw = w - 2;
-        int ph = std::min(h - 12, 25);
-        if (ph < 5) ph = std::max(3, h - 3);
+        int memh = h >= 26 ? memory_height() : 0;
+        int ph = std::min(h - 12 - memh, 25);
+        if (ph < 5) ph = std::max(3, h - 3 - memh);
         box_at(y, x, ph, w, "PINS  \u2191\u2193 \u23CE \u2190\u2192  TAB", focus == F_PINS);
         put(y + 1, x + 1, iw, COLOR_PAIR(C_DIMTXT) | A_UNDERLINE, " PIN  PRT MODE  LV DRV  ANALOG     ");
         int vis = ph - 3, off = 0;
@@ -1958,7 +2107,8 @@ public:
             put(y + 2 + r, x + 1, iw, attr, s + (i == sel ? std::string(std::max(0, iw - (int)s.size()), ' ') : ""));
         }
 
-        int py = y + ph, phh = h - ph;
+        if (memh) draw_memory(y + ph, x, w, memh);
+        int py = y + ph + memh, phh = h - ph - memh;
         if (phh < 3) return;
         box_at(py, x, phh, w, "PERIPHERALS");
         std::vector<std::pair<std::string, int> > L;
@@ -2260,6 +2410,10 @@ public:
         fprintf(stderr, "\n--- nanoemu: %.3f s simulated in %.3f s (%.1fx realtime), %llu instructions\n",
                 m.cycles / F_CPU, el, el > 0 ? m.cycles / F_CPU / el : 0.0, (unsigned long long)m.instrs);
         if (!m.event.empty()) fprintf(stderr, "--- %s\n", m.event.c_str());
+        MemInfo mi = mem_info();
+        fprintf(stderr, "--- memory: RAM %d B, used %d, free %d, stack %d (peak %d)%s; ROM %d of %d B\n", mi.sram, mi.used,
+                mi.avail, mi.stack, mi.peak, mi.symbols ? strf(", data %d, bss %d, heap %d", mi.data, mi.bss, mi.heap).c_str() : "",
+                fw_size, FLASH_WORDS * 2 - BOOT_BYTES);
         fprintf(stderr, "--- pins:");
         for (int i = 0; i < NPINS; i++) {
             double f, d;
@@ -2317,29 +2471,53 @@ static void usage(const char *p) {
             "  -i TEXT      (headless/serial) bytes to send to the serial RX line at start\n"
             "  -b WHERE     breakpoint: function | file:line | 0xADDR (repeatable)\n"
             "  -S DIR       extra directory to search for source files (repeatable)\n"
-            "  -p           start paused\n",
+            "  -p           start paused\n"
+            "  --ram BYTES  test with more SRAM than the 328P's 2K (e.g. 4096, 8K; multiple of 256, max 65280)\n"
+            "  --flash SIZE test with more flash than 32K: 64K or 128K\n",
             p);
 }
 
+// size in bytes: 4096, 8K, 64k
+static long parse_size(const char *t) {
+    char *e = 0;
+    long v = strtol(t, &e, 10);
+    if (e && (*e == 'k' || *e == 'K')) v *= 1024;
+    return v;
+}
+
 int main(int argc, char **argv) {
-    static App app; // large (pin logs); keep off the stack
     double hsecs = -1;
     std::string inject, file;
+    std::vector<std::string> bps, dirs;
     bool start_paused = false, serial_only = false;
     double speed = 1;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "-H" && i + 1 < argc) hsecs = atof(argv[++i]);
         else if (a == "-i" && i + 1 < argc) inject = argv[++i];
-        else if (a == "-b" && i + 1 < argc) app.bp_specs.push_back(argv[++i]);
-        else if (a == "-S" && i + 1 < argc) app.src_dirs.push_back(argv[++i]);
+        else if (a == "-b" && i + 1 < argc) bps.push_back(argv[++i]);
+        else if (a == "-S" && i + 1 < argc) dirs.push_back(argv[++i]);
         else if (a == "-p") start_paused = true;
         else if (a == "-c" || a == "--serial") serial_only = true;
         else if (a == "--speed" && i + 1 < argc) speed = atof(argv[++i]);
+        else if (a == "--ram" && i + 1 < argc) {
+            long v = parse_size(argv[++i]);
+            if (v < 2048 || v > 0xFF00 || v % 256) { fprintf(stderr, "--ram: 2048 to 65280 bytes, a multiple of 256 (e.g. 4096, 8K)\n"); return 1; }
+            RAM_END = 0x100 + (int)v;
+        } else if (a == "--flash" && i + 1 < argc) {
+            long v = parse_size(argv[++i]);
+            if (v != 32768 && v != 65536 && v != 131072) { fprintf(stderr, "--flash: 32K, 64K or 128K\n"); return 1; }
+            FLASH_WORDS = (int)(v / 2);
+            PC_MASK = FLASH_WORDS - 1;
+        }
         else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
         else if (a[0] == '-') { usage(argv[0]); return 1; }
         else file = a;
     }
+    static App *papp = new App; // built after the sizes are known; large (pin logs), so on the heap
+    App &app = *papp;
+    app.bp_specs = bps;
+    app.src_dirs = dirs;
     if (!file.empty() && !app.load(file)) {
         fprintf(stderr, "%s\n", app.msg.c_str());
         return 1;

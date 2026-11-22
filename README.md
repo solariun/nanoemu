@@ -78,6 +78,25 @@ The UART also shows up as a pseudo-terminal. Its path, such as `/dev/ttys004`, i
 screen /dev/ttys004 115200
 ```
 
+## Memory panel
+
+The **MEMORY** panel shows memory use live:
+
+- **RAM:** a block map of the SRAM, lowest address top left. Each cell covers a few bytes (the title shows how many) and is colored by what holds it: `.data`, `.bss`, the `malloc()` heap, the stack, the stack's peak so far (`▒`), or free (`·`). Under the map: total, used, and free (the gap between the heap and the stack), plus the current and peak stack size and the heap size.
+- **ROM:** the program's size against the 30,720 bytes a Nano sketch can use, with the 2 KB bootloader area at the end.
+- **EEPROM:** bytes in use and the number of writes.
+
+The RAM regions come from the `.elf` (its `.data`, `.bss` and `.noinit` sections and the `__heap_start` and `__brkval` symbols). With only a `.hex` or `.bin`, the map shows the bytes written so far and the stack.
+
+### Testing with more memory
+
+```bash
+./nanoemu --ram 8K sketch.ino.elf      # SRAM of 8 KB instead of 2 KB (multiple of 256, up to 65280)
+./nanoemu --flash 64K big.hex          # flash of 64 KB or 128 KB instead of 32 KB
+```
+
+Firmware built for the ATmega328P sets the stack pointer to the 328P's top of RAM (`0x08FF`) at startup. With `--ram`, nanoemu moves it to the new top, so the stack and `malloc()` really get the extra space. `.data` and `.bss` stay where the linker put them. The headless and `--serial` modes print the same figures on stderr when they stop.
+
 ## Seeing the code that runs
 
 Load the `.elf` that arduino-cli or the Arduino IDE produces (it sits next to the `.hex`), or load a `.hex` that has its `.elf` beside it. nanoemu then reads the symbols and the DWARF line tables, and shows:

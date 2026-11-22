@@ -55,3 +55,13 @@ jobs:
         cat out.txt stats.txt
         grep -q "HELLO" out.txt
         grep -q "1.800 s simulated" stats.txt
+
+    - name: Memory figures and --ram
+      run: |
+        ./nanoemu -H 1 examples/demo/demo.elf > out.txt 2> stats.txt
+        cat stats.txt
+        grep -q "memory: RAM 2048 B" stats.txt
+        ./nanoemu -H 1 --ram 8K examples/demo/demo.elf > out.txt 2> stats.txt
+        cat out.txt stats.txt
+        grep -q "nanoemu demo - boot" out.txt
+        grep -q "memory: RAM 8192 B" stats.txt
