@@ -51,7 +51,7 @@ Use a terminal of at least 110×34. 180×50 or larger looks best.
 | Key | Action |
 |---|---|
 | `SPACE` | run / pause |
-| `s` | single-step one instruction (pauses) |
+| `s` | tap: run one instruction (pauses). Hold: run at the current speed while the key is down, then pause again; a breakpoint stops it even while held. Holding is detected through the keyboard's auto-repeat, so the first moment counts as one or two steps |
 | `r` | restart (hard reset, keeps flash and EEPROM) |
 | `l` / `F5` | reload the firmware file from disk and reset |
 | `f` | open another firmware file |

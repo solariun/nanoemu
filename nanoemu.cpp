@@ -1283,14 +1283,25 @@ public:
         const Sec *dl = find(".debug_line");
         auto blob = [&](const Sec *s) { Blob o = {s ? &b[s->off] : 0, s ? s->size : 0}; return o; };
         if (dl) parse_lines(&b[dl->off], dl->size, blob(find(".debug_line_str")), blob(find(".debug_str")));
-        std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &c) { return a.addr < c.addr || (a.addr == c.addr && a.end && !c.end); });
-        word_row.assign(FLASH_WORDS, -1);
-        for (size_t i = 0; i < rows.size(); i++) {
-            if (rows[i].end || rows[i].file < 0) continue;
-            uint32_t a1 = i + 1 < rows.size() ? rows[i + 1].addr : rows[i].addr + 2;
-            for (uint32_t a = rows[i].addr; a < a1 && a / 2 < (uint32_t)FLASH_WORDS; a += 2) word_row[a / 2] = (int32_t)i;
-        }
+        std::stable_sort(rows.begin(), rows.end(), [](const Row &a, const Row &c) { return a.addr < c.addr || (a.addr == c.addr && a.end && !c.end); });
         for (size_t i = 0; i < files.size(); i++) file_user.push_back(!is_internal(files[i]));
+        word_row.assign(FLASH_WORDS, -1);
+        for (size_t i = 0; i < rows.size();) {
+            // rows sharing an address (inlined code: loop() into main(), millis() into loop()):
+            // the last one in user code wins, otherwise the last one
+            size_t j = i, pick = SIZE_MAX, last = SIZE_MAX;
+            for (; j < rows.size() && rows[j].addr == rows[i].addr; j++) {
+                if (rows[j].end || rows[j].file < 0) continue;
+                last = j;
+                if (file_user[rows[j].file]) pick = j;
+            }
+            if (pick == SIZE_MAX) pick = last;
+            if (pick != SIZE_MAX) {
+                uint32_t a1 = j < rows.size() ? rows[j].addr : rows[i].addr + 2;
+                for (uint32_t a = rows[i].addr; a < a1 && a / 2 < (uint32_t)FLASH_WORDS; a += 2) word_row[a / 2] = (int32_t)pick;
+            }
+            i = j;
+        }
         user_word.assign(FLASH_WORDS, 0);
         for (int w = 0; w < FLASH_WORDS; w++) user_word[w] = is_user_row(word_row[w]);
         elf = path;
@@ -1605,6 +1616,11 @@ public:
     std::vector<std::string> bp_specs, src_dirs;
     bool show_source = true;
     bool show_internal = false; // 'a': also show Arduino/toolchain code in the SOURCE panel
+    // 's': a tap steps one instruction; holding it runs at the current speed. A terminal sends no key-release,
+    // so holding is seen through the keyboard's auto-repeat: presses closer than HOLD_GAP apart.
+    static constexpr double HOLD_GAP = 0.20, RELEASE_GAP = 0.25;
+    double s_last = -1;
+    bool s_hold = false, s_block = false; // running while held / ignoring repeats after a breakpoint
     int last_row = -1;
     std::string input;
     std::string msg;
@@ -1978,7 +1994,7 @@ public:
         put(y + 5, x + 1, iw, 0, strf(" INST %llu", (unsigned long long)m.instrs));
         double sp = SPEEDS[speed_i];
         put(y + 6, x + 1, iw, 0, strf(" RATE %.2f MHz %s", rate / 1e6, sp ? strf("(x%g)", sp).c_str() : "(max)"));
-        std::string st = m.paused ? "PAUSED" : m.sleeping ? "SLEEP" : "RUNNING";
+        std::string st = m.paused ? "PAUSED" : s_hold ? "RUNNING (s held)" : m.sleeping ? "SLEEP" : "RUNNING";
         put(y + 7, x + 1, iw, COLOR_PAIR(m.paused ? C_WARN : kp(K_HI, false)) | A_BOLD, " " + st);
         int nbp = bp_count();
         if (nbp) put(y + 7, x + 12, iw - 11, COLOR_PAIR(kp(K_LO, false)), strf("%d breakpoint%s", nbp, nbp > 1 ? "s" : ""));
@@ -2414,7 +2430,15 @@ public:
         switch (ch) {
         case 'q': case 'Q': quit = true; break;
         case ' ': m.paused = !m.paused; break;
-        case 's': case 'n': m.paused = true; m.step(); break;
+        case 's': case 'n': {
+            double t = mono();
+            bool repeat = s_last >= 0 && t - s_last < HOLD_GAP;
+            s_last = t;
+            if (s_block) break;                                   // stopped at a breakpoint: wait for the release
+            if (repeat) { s_hold = true; m.paused = false; break; } // held down: run
+            if (!s_hold) { m.paused = true; m.step(); }             // a tap: one instruction
+            break;
+        }
         case 'v': show_source = !show_source; break;
         case 'a':
             show_internal = !show_internal;
@@ -2494,6 +2518,11 @@ public:
                 double deadline = now + 0.03;
                 while (m.cycles < target && !m.paused && mono() < deadline)
                     m.run_until(std::min(target, m.cycles + 50000));
+            }
+            if (s_hold && m.paused) { s_hold = false; s_block = true; } // a breakpoint stopped the held run
+            if ((s_hold || s_block) && mono() - s_last > RELEASE_GAP) { // 's' released
+                if (s_hold) m.paused = true;
+                s_hold = s_block = false;
             }
             if (!m.event.empty()) { set_msg(m.event); m.event.clear(); }
             drain_tx();
