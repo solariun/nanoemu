@@ -78,6 +78,18 @@ The UART also shows up as a pseudo-terminal. Its path, such as `/dev/ttys004`, i
 screen /dev/ttys004 115200
 ```
 
+## Logic analyzer
+
+The bottom panel shows all 20 digital pins (D0–D13, A0–A5), one row each. Each row's label gives the pin, its mode, and, measured over the visible window, the **frequency in Hz**, the **duty cycle** and the **average crest**: how long the pin stays high per pulse. TX and RX show only their mode.
+
+A box on the right details the highlighted pin (select it with ↑↓):
+
+- its level and whether it is an output, an input, or driven by the UART;
+- frequency and period, duty, crest (average, and its spread when pulses vary), low time;
+- edge counts in the window and the time since the last edge;
+- for a PWM pin, the timer and channel behind it, its mode and prescaler, OCR against TOP, and the frequency those settings should give, to compare with the measured one;
+- for TX/RX, the baud rate, the time of one bit and one byte, and the bytes sent and received.
+
 ## Memory panel
 
 The **MEMORY** panel shows memory use live:

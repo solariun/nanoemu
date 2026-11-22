@@ -993,6 +993,50 @@ public:
         duty = (double)high / (tb - ta);
         if (rises >= 2 && last > first) freq = (rises - 1) * F_CPU / (last - first);
     }
+    // Pulse statistics of a pin over [ta, tb]. Only pulses with both edges inside the window count
+    // for the averages; duty includes the partial ones at the window's ends.
+    struct Pulses {
+        double freq, period, duty;         // Hz, seconds, 0..1
+        double hi_avg, hi_min, hi_max;     // high time per pulse (the crest), seconds
+        double lo_avg;                     // low time between pulses, seconds
+        int rises, falls, highs, lows;
+        uint64_t last_edge;                // cycle of the last edge in the window (0 = none)
+    };
+    Pulses pulses(int i, uint64_t ta, uint64_t tb) const {
+        Pulses r;
+        memset(&r, 0, sizeof r);
+        if (tb <= ta) return r;
+        uint64_t k0 = log_idx(i, ta), k1 = log_idx(i, tb);
+        if (k1 - k0 > 20000) { k0 = k1 - 20000; ta = ev_cyc(i, k0); k0++; }
+        int lvl = level_at(i, ta);
+        uint64_t t = ta, high = 0, first_rise = 0, last_rise = 0, hsum = 0, lsum = 0;
+        uint64_t hmin = UINT64_MAX, hmax = 0;
+        bool bounded = false; // the current segment started at an edge inside the window
+        for (uint64_t k = k0; k < k1; k++) {
+            uint64_t c = ev_cyc(i, k);
+            uint64_t len = c - t;
+            if (lvl) high += len;
+            if (bounded) {
+                if (lvl) { hsum += len; r.highs++; hmin = std::min(hmin, len); hmax = std::max(hmax, len); }
+                else { lsum += len; r.lows++; }
+            }
+            t = c;
+            lvl = ev_lvl(i, k);
+            bounded = true;
+            r.last_edge = c;
+            if (lvl) { if (!r.rises) first_rise = c; last_rise = c; r.rises++; } else r.falls++;
+        }
+        if (lvl) high += tb - t;
+        r.duty = (double)high / (tb - ta);
+        if (r.rises >= 2 && last_rise > first_rise) {
+            r.period = (last_rise - first_rise) / F_CPU / (r.rises - 1);
+            r.freq = 1 / r.period;
+        }
+        if (r.highs) { r.hi_avg = hsum / F_CPU / r.highs; r.hi_min = hmin / F_CPU; r.hi_max = hmax / F_CPU; }
+        if (r.lows) r.lo_avg = lsum / F_CPU / r.lows;
+        return r;
+    }
+
     bool pwm_active(int i) const {
         int p = pin_port(i), b = pin_bit(i);
         return (ovr_mask[p] & ram[A_DDR(p)] & (1 << b)) && !(p == 2 && b == 1);
@@ -1550,7 +1594,7 @@ public:
     std::string fw_path;
     int fw_size = 0;
     bool quit = false;
-    int speed_i = 5, tb_i = 5;
+    int speed_i = 5, tb_i = 6;
     bool trigger = false;
     enum Focus { F_PINS, F_SCOPE } focus = F_PINS; // TAB switches where the arrow keys go
     int tcur = -1;                                  // analyzer time cursor: columns left of "now", -1 = hidden
@@ -1704,8 +1748,14 @@ public:
     // ------------------------------------------------------------- drawing
     void put(int y, int x, int maxw, int attr, const std::string &s) {
         if (maxw <= 0 || y < 0 || y >= LINES) return;
+        // clip to maxw columns, counting UTF-8 characters, not bytes
+        size_t n = 0;
+        for (int cols = 0; n < s.size() && cols < maxw; cols++) {
+            n++;
+            while (n < s.size() && ((unsigned char)s[n] & 0xC0) == 0x80) n++;
+        }
         attron(attr);
-        mvaddnstr(y, x, s.c_str(), std::min((int)s.size(), maxw));
+        mvaddnstr(y, x, s.c_str(), (int)n);
         attroff(attr);
     }
     void uput(int y, int x, int attr, const char *s) { attron(attr); mvaddstr(y, x, s); attroff(attr); }
@@ -2144,11 +2194,80 @@ public:
 
     // Logic analyzer: all 20 digital pins, D0..D9 on the left half, D10..D13 and A0..A5 on the right,
     // one row each. High is a raised bar, low a baseline, an edge a vertical bar, faster activity a shade.
+    // Each label shows the pin, its mode, frequency, duty and average crest (high time); a box on the right
+    // details the highlighted pin.
     static const char *short_mode(const std::string &md) { return md == "IN_PU" ? "PU" : md.c_str(); }
+    static std::string fmt_hz(double f) {
+        if (f <= 0) return "-";
+        if (f >= 100000) return strf("%.0fkHz", f / 1000);
+        if (f >= 10000) return strf("%.1fkHz", f / 1000);
+        if (f >= 1000) return strf("%.2fkHz", f / 1000);
+        return f >= 10 ? strf("%.0fHz", f) : strf("%.1fHz", f);
+    }
+    static std::string fmt_dt(double s) { // compact duration, at most 6 characters
+        if (s <= 0) return "-";
+        if (s < 1e-3) return strf("%.0fus", s * 1e6);
+        if (s < 1e-2) return strf("%.2fms", s * 1e3);
+        if (s < 1) return strf("%.0fms", s * 1e3);
+        return strf("%.2fs", s);
+    }
+    bool is_uart_pin(int i) const { return (i == 0 && (m.ram[UCSR0B] & 0x10)) || (i == 1 && (m.ram[UCSR0B] & 0x08)); }
+
+    void draw_pin_detail(int y, int x, int w, int h, int i, uint64_t t0, uint64_t tend) {
+        int p = pin_port(i), b = pin_bit(i);
+        std::string md = m.pin_mode(i);
+        box_at(y, x, h, w, strf("%s  P%c%d  %s", PIN_NAME[i], "BCD"[p], b, md.c_str()));
+        int iw = w - 2, row = y + 1, last = y + h - 2;
+        auto line = [&](const std::string &k, const std::string &v, int attr) {
+            if (row <= last) put(row++, x + 1, iw, attr, strf(" %-7s %s", k.c_str(), v.c_str()));
+        };
+        Nano::Pulses r = m.pulses(i, t0, tend);
+        double win = (tend - t0) / F_CPU;
+        line("level", strf("%d  %s", m.level(i), is_uart_pin(i) ? (i ? "UART TX (USART drives it)" : "UART RX")
+                                                 : m.ram[A_DDR(p)] & (1 << b) ? "output" : m.ext[i] >= 0 ? "input, driven" : "input"), A_BOLD);
+        if (is_uart_pin(i)) {
+            int bc = m.uart_bitcyc();
+            line("baud", strf("%.0f  8N1%s", m.baud(), m.ram[UCSR0A] & 2 ? " U2X" : ""), 0);
+            line("bit", fmt_time(bc / F_CPU) + strf("  byte %s", fmt_time(10 * bc / F_CPU).c_str()), 0);
+            line("bytes", strf("TX %llu  RX %llu", (unsigned long long)m.us.txn, (unsigned long long)m.us.rxn), 0);
+        } else {
+            line("freq", r.freq > 0 ? strf("%.2f Hz  T %s", r.freq, fmt_time(r.period).c_str()) : std::string("- (under 2 periods)"), A_BOLD);
+            line("duty", strf("%.1f %%", r.duty * 100), A_BOLD);
+            double dev = std::max(r.hi_max - r.hi_avg, r.hi_avg - r.hi_min);
+            line("crest", r.highs ? fmt_dt(r.hi_avg) + " avg" + (dev > r.hi_avg * 0.01 ? " \u00B1" + fmt_dt(dev) : std::string(""))
+                                  : std::string("-"), A_BOLD);
+            line("low", r.lows ? fmt_dt(r.lo_avg) + " avg" : "-", 0);
+        }
+        line("edges", strf("%d\u2191 %d\u2193  last %s", r.rises, r.falls,
+                           r.last_edge ? (fmt_dt((m.cycles - r.last_edge) / F_CPU) + " ago").c_str() : ("none in " + fmt_time(win)).c_str()),
+             COLOR_PAIR(C_DIMTXT));
+        // the timer behind a PWM pin, and the frequency its settings give
+        for (int t = 0; t < 3; t++)
+            for (int ch = 0; ch < 2; ch++) {
+                const Nano::Timer &tm = m.tm[t];
+                if ((ch ? tm.pb : tm.pa) != p || (ch ? tm.bb : tm.ba) != b || !m.oc_connected(tm, ch)) continue;
+                int kind; uint16_t top; bool toc;
+                m.timer_mode(tm, kind, top, toc);
+                static const char *kn[4] = {"NORM", "CTC", "FPWM", "PCPWM"};
+                int cs = m.ram[tm.tccrb] & 7, dv = cs ? tm.div[cs] : 0;
+                uint16_t ocr = tm.wide ? m.r16(ch ? tm.ocrb : tm.ocra) : m.ram[ch ? tm.ocrb : tm.ocra];
+                line("timer", strf("%s OC%c %s /%d", tm.name, ch ? 'B' : 'A', kn[kind], dv), COLOR_PAIR(kp(K_PWM, false)));
+                line("ocr", strf("%u of TOP %u", ocr, top), COLOR_PAIR(kp(K_PWM, false)));
+                if (dv) {
+                    double ef = kind == Nano::K_PC ? F_CPU / (2.0 * dv * top) : kind == Nano::K_CTC ? F_CPU / (2.0 * dv * (top + 1))
+                                                                                              : F_CPU / ((double)dv * (top + 1));
+                    line("expect", strf("%.2f Hz", ef), COLOR_PAIR(kp(K_PWM, false)));
+                }
+            }
+    }
+
     void draw_scope(int y, int x, int w, int h) {
         double us = TIMEBASES[tb_i];
-        const int lw = 19;
-        int half = (w - 2) / 2, tw = half - lw - 3;
+        const int lw = 28;
+        bool detail = sel < NPINS && w >= 150 && h >= 8;
+        const int dw = 34;
+        int cw = detail ? w - dw - 1 : w;      // width used by the channels
+        int half = (cw - 2) / 2, tw = half - lw - 3;
         if (tw < 8 || h < 4) return;
         uint64_t cpc = (uint64_t)(us * 16); // cycles per column
         uint64_t win = cpc * tw;
@@ -2176,13 +2295,15 @@ public:
             int row = i % 10;
             if (row >= rows) continue;
             int bx = x + 1 + (i / 10) * half, ry = y + 1 + row;
-            double f, du;
-            m.measure(i, t0, tend, f, du);
             std::string md = m.pin_mode(i);
-            std::string fs = f >= 10000 ? strf("%.0fk", f / 1000) : f >= 1000 ? strf("%.1fk", f / 1000)
-                           : f > 0 ? strf("%.0f", f) : std::string("-");
             int k = pin_kind(i);
-            std::string lab = strf("%-3s %-3s %5s %3d%%", PIN_NAME[i], short_mode(md), fs.c_str(), (int)lround(du * 100));
+            std::string lab;
+            if (is_uart_pin(i)) lab = strf("%-3s %-3s", PIN_NAME[i], short_mode(md)); // TX/RX: the detail box has the UART figures
+            else {
+                Nano::Pulses r = m.pulses(i, t0, tend);
+                lab = strf("%-3s %-3s %7s %3d%% %6s", PIN_NAME[i], short_mode(md), fmt_hz(r.freq).c_str(),
+                           (int)lround(r.duty * 100), r.highs ? fmt_dt(r.hi_avg).c_str() : "-");
+            }
             put(ry, bx, lw, i == sel ? (COLOR_PAIR(C_SEL) | A_BOLD) : (COLOR_PAIR(kp(k, false)) | A_BOLD), lab);
             for (int col = 0; col < tw; col++) {
                 if (tend < win && (uint64_t)col * cpc < win - tend) continue; // before t=0
@@ -2204,7 +2325,7 @@ public:
         if (ay < y + h - 1)
             for (int hlf = 0; hlf < 2; hlf++) {
                 int bx = x + 1 + hlf * half;
-                put(ay, bx, lw, COLOR_PAIR(C_DIMTXT), trigger ? " t=trigger-10%" : " t=now");
+                put(ay, bx, lw, COLOR_PAIR(C_DIMTXT), trigger ? " t=trigger-10%" : "     Hz   duty  crest  t=now");
                 for (int col = 0; col + 8 < tw; col += 10) {
                     double rel = -(double)(tw - col) * cpc / F_CPU;
                     uput(ay, bx + lw + 1 + col, COLOR_PAIR(C_DIMTXT), "╵");
@@ -2212,6 +2333,7 @@ public:
                 }
                 if (ccol >= 0) uput(ay, bx + lw + 1 + ccol, COLOR_PAIR(C_WARN) | A_BOLD, "▲");
             }
+        if (detail) draw_pin_detail(y + 1, x + w - dw - 1, dw, h - 2, sel, t0, tend);
     }
 
     void draw() {
