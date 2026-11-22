@@ -55,6 +55,7 @@ Use a terminal of at least 110×34. 180×50 or larger looks best.
 | `f` | open another firmware file |
 | `b` | toggle a breakpoint: `function`, `file:line`, `line` (in the current file) or `0xADDR`. Empty input clears all of them |
 | `v` | show/hide the source panel |
+| `a` | SOURCE panel: also show Arduino's internal code (core, libraries, avr-libc). Hidden by default |
 | `+` / `-` | simulation speed: x0.001 … x10, or max |
 | `[` / `]` | oscilloscope timebase (1 µs … 100 ms per column) |
 | `t` | toggle the scope trigger (rising edge of the first channel) |
@@ -78,7 +79,7 @@ screen /dev/ttys004 115200
 
 Load the `.elf` that arduino-cli or the Arduino IDE produces (it sits next to the `.hex`), or load a `.hex` that has its `.elf` beside it. nanoemu then reads the symbols and the DWARF line tables, and shows:
 
-- a **SOURCE** panel with the C/C++ line being executed, highlighted. This also covers Arduino core and library code.
+- a **SOURCE** panel with the line of *your* code being executed, highlighted. While the CPU is inside Arduino's own code (the core, libraries, avr-libc), it stays on the last line of yours that ran, usually the call that led there, and the title says where execution actually is. Press `a` to follow Arduino's code too.
 - under it, the **current values of the global and static variables** used on that line, read live from RAM. Locals and class members aren't shown.
 - the **function** being executed in the CODE title (for example `MyThread::run()+0x22`), with function names on `call` targets and labels in the disassembly.
 

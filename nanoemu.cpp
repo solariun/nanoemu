@@ -133,6 +133,8 @@ public:
     std::string event;   // set when execution stops on its own
 
     std::vector<uint8_t> bpw; // breakpoint flag per flash word
+    const uint8_t *user_map = 0;  // per flash word: 1 when its source is user code (set by the UI)
+    int last_user_pc = -1;        // last word address executed in user code
     uint64_t irq_count[26] = {0};
     int last_irq = 0;
 
@@ -202,6 +204,7 @@ public:
         ram[TWSR] = 0xF8;
         ram[MCUSR] = mcusr;
         pc = 0; sleeping = irq_inhibit = false;
+        if (hard) last_user_pc = -1;
         for (int i = 0; i < 3; i++) { tm[i].pre = 0; tm[i].dir = 1; tm[i].oc = 0; }
         us = decltype(us)();
         rxq.clear();
@@ -923,6 +926,7 @@ public:
             int v = irq_pending();
             if (v) { sleeping = false; take_irq(v); tick(slept ? 8 : 4); }
         }
+        if (user_map && user_map[pc]) last_user_pc = pc;
         if (bpw[pc]) { paused = true; event = strf("breakpoint at 0x%04X", pc * 2); }
     }
 
@@ -1026,16 +1030,30 @@ public:
     std::vector<Row> rows;               // sorted by address
     std::vector<std::string> files;      // global file table
     std::vector<int32_t> word_row;       // flash word -> row index or -1
+    std::vector<uint8_t> user_word;      // flash word -> 1 when its line is in user code
+    std::vector<uint8_t> file_user;      // per file: 1 = user code, 0 = Arduino/toolchain internals
     std::vector<std::string> search;     // extra directories to look for sources
     std::map<int, std::vector<std::string> > src;
     std::map<int, std::string> src_path;
 
     void clear() {
         elf.clear(); funcs.clear(); objs.clear(); rows.clear(); files.clear();
-        word_row.clear(); src.clear(); src_path.clear(); fidx.clear();
+        word_row.clear(); user_word.clear(); file_user.clear(); src.clear(); src_path.clear(); fidx.clear();
     }
     bool loaded() const { return !elf.empty(); }
     bool has_lines() const { return !rows.empty(); }
+
+    // Arduino core and libraries, avr-libc, GCC runtime, generated sketch wrapper, or no real path
+    static bool is_internal(const std::string &p) {
+        static const char *pat[] = {"/Arduino15/", "/arduino15/", "/.arduino15/", "/arduino/sketches/",
+                                    "/Arduino/libraries/", "/arduino/libraries/", "/arduino-sketch-", "/arduino_build_",
+                                    "/avr/include/", "avr-libc", "/libgcc/", "/gcc/avr/"};
+        if (p.empty() || p[0] != '/') return true;
+        for (size_t i = 0; i < sizeof pat / sizeof pat[0]; i++)
+            if (p.find(pat[i]) != std::string::npos) return true;
+        return false;
+    }
+    bool is_user_row(int r) const { return r >= 0 && file_user[rows[r].file]; }
 
     int row_at(uint32_t byteaddr) const {
         uint32_t w = byteaddr >> 1;
@@ -1193,6 +1211,9 @@ public:
             uint32_t a1 = i + 1 < rows.size() ? rows[i + 1].addr : rows[i].addr + 2;
             for (uint32_t a = rows[i].addr; a < a1 && a / 2 < (uint32_t)FLASH_WORDS; a += 2) word_row[a / 2] = (int32_t)i;
         }
+        for (size_t i = 0; i < files.size(); i++) file_user.push_back(!is_internal(files[i]));
+        user_word.assign(FLASH_WORDS, 0);
+        for (int w = 0; w < FLASH_WORDS; w++) user_word[w] = is_user_row(word_row[w]);
         elf = path;
         return true;
     }
@@ -1503,6 +1524,7 @@ public:
     DebugInfo dbg;
     std::vector<std::string> bp_specs, src_dirs;
     bool show_source = true;
+    bool show_internal = false; // 'a': also show Arduino/toolchain code in the SOURCE panel
     int last_row = -1;
     std::string input;
     std::string msg;
@@ -1540,6 +1562,7 @@ public:
     }
     // symbols/lines from the .elf itself, or from a sibling .elf of a .hex/.bin
     std::string load_symbols(const std::string &path) {
+        m.user_map = 0;
         dbg.clear();
         last_row = -1;
         std::string ep = path;
@@ -1556,6 +1579,7 @@ public:
                             ep != path ? strf(" from %s", base_name(ep).c_str()).c_str() : "");
             else info = ", no debug info: " + err;
         }
+        if (!dbg.user_word.empty()) m.user_map = &dbg.user_word[0];
         dbg.search = src_dirs;
         dbg.search.push_back(dir_name(path));
         apply_breakpoints();
@@ -1789,19 +1813,29 @@ public:
     }
 
     void draw_source(int y, int x, int w, int h) {
+        std::string fn = dbg.where(m.pc * 2);
         int r = dbg.row_at(m.pc * 2);
         bool here = r >= 0;
-        if (here) last_row = r; else r = last_row;
-        std::string fn = dbg.where(m.pc * 2);
+        std::string note;
+        if (!show_internal && !dbg.is_user_row(r)) {
+            // executing Arduino/toolchain code: stay on the last user line that ran
+            here = false;
+            r = m.last_user_pc >= 0 ? dbg.row_at(m.last_user_pc * 2) : -1;
+            note = "  now in " + (fn.empty() ? strf("0x%04X", m.pc * 2) : fn) + " (a: show)";
+            fn.clear();
+        } else if (here) last_row = r;
+        else { r = last_row; note = " (last line with info)"; }
         if (r < 0) {
             box_at(y, x, h, w, "SOURCE");
-            put(y + 1, x + 2, w - 4, COLOR_PAIR(C_DIMTXT), strf("no line info at 0x%04X %s", m.pc * 2, fn.c_str()));
+            put(y + 1, x + 2, w - 4, COLOR_PAIR(C_DIMTXT),
+                show_internal ? strf("no line info at 0x%04X %s", m.pc * 2, fn.c_str())
+                              : "no user code has run yet" + note);
             return;
         }
         const DebugInfo::Row &row = dbg.rows[r];
         std::string path;
         const std::vector<std::string> *lines = dbg.source(row.file, path);
-        box_at(y, x, h, w, strf("SOURCE %s:%d%s  %s", base_name(path).c_str(), row.line, here ? "" : " (last line with info)", fn.c_str()));
+        box_at(y, x, h, w, strf("SOURCE %s:%d  %s%s", base_name(path).c_str(), row.line, fn.c_str(), note.c_str()));
         int iw = w - 2, ih = h - 2;
         if (!lines) { put(y + 1, x + 2, iw - 2, COLOR_PAIR(C_WARN), "source not found: " + path + "  (use -S DIR)"); return; }
         std::string vars = row.line >= 1 && row.line <= (int)lines->size() ? line_vars((*lines)[row.line - 1]) : "";
@@ -2047,7 +2081,7 @@ public:
 
         // key bar
         const char *keys[][2] = {{"SPC", "run/pause"}, {"s", "step"}, {"r", "restart"}, {"l", "reload"}, {"f", "open"},
-                                 {"b", "breakpt"}, {"v", "source"}, {"+-", "speed"}, {"[]", "timebase"}, {"t", "trig"}, {"⏎←→", "drive"},
+                                 {"b", "breakpt"}, {"v", "source"}, {"a", "internal"}, {"+-", "speed"}, {"[]", "timebase"}, {"t", "trig"}, {"⏎←→", "drive"},
                                  {"o", "scope"}, {"TAB", "serial"}, {"q", "quit"}};
         int kx = 0;
         move(H - 1, 0);
@@ -2094,6 +2128,10 @@ public:
         case ' ': m.paused = !m.paused; break;
         case 's': case 'n': m.paused = true; m.step(); break;
         case 'v': show_source = !show_source; break;
+        case 'a':
+            show_internal = !show_internal;
+            set_msg(show_internal ? "source: showing all code (Arduino core, libraries, avr-libc)" : "source: user code only");
+            break;
         case 'r': case 'R': restart(); break;
         case 'l': case 'L': case KEY_F(5): if (!fw_path.empty()) load(fw_path); else set_msg("no firmware loaded, press f"); break;
         case 'f': mode = PROMPT_FILE; input = fw_path; break;
