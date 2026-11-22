@@ -51,7 +51,7 @@ Use a terminal of at least 110×34. 180×50 or larger looks best.
 | Key | Action |
 |---|---|
 | `SPACE` | run / pause |
-| `s` | tap: run one instruction (pauses); quick taps still step one at a time. Hold: run slowly, at 0.001× by default (`--hold-speed X` changes it; `--hold-speed 0` uses the current speed), while the key is down, and pause right after it comes up; a breakpoint stops it even while held. A terminal reports no key release, so holding is recognized from the keyboard's auto-repeat (two presses in a row under 0.12 s apart), and the release from a pause of twice the repeat interval (60–200 ms). If the system's key repeat is set slower than 0.12 s, holding works as repeated steps |
+| `s` | tap: run one instruction (pauses); quick taps still step one at a time. Hold: run slowly, at 0.0001× by default (`--hold-speed X` changes it; `--hold-speed 0` uses the current speed), while the key is down, and pause right after it comes up; a breakpoint stops it even while held. A terminal reports no key release, so holding is recognized from the keyboard's auto-repeat (two presses in a row under 0.12 s apart), and the release from a pause of twice the repeat interval (60–200 ms). If the system's key repeat is set slower than 0.12 s, holding works as repeated steps |
 | `r` | restart (hard reset, keeps flash and EEPROM) |
 | `l` / `F5` | reload the firmware file from disk and reset |
 | `f` | open another firmware file |

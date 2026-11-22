@@ -1623,7 +1623,7 @@ public:
     static constexpr double HOLD_GAP = 0.12, RELEASE_MIN = 0.06, RELEASE_MAX = 0.20;
     double s_last = -1, s_gap1 = 1, s_gap2 = 1; // time of the last press, last two gaps
     bool s_hold = false, s_block = false;        // running while held / ignoring repeats after a breakpoint
-    double hold_speed = 0.001; // speed while 's' is held (--hold-speed; 0 = the current speed)
+    double hold_speed = 0.0001; // speed while 's' is held (--hold-speed; 0 = the current speed)
     double run_speed() const { return s_hold && hold_speed > 0 ? hold_speed : SPEEDS[speed_i]; }
     double release_gap() const { return std::max(RELEASE_MIN, std::min(RELEASE_MAX, 2 * std::max(s_gap1, s_gap2))); }
     int last_row = -1;
@@ -2630,7 +2630,7 @@ static void usage(const char *p) {
             "  -c, --serial run without the TUI, in real time: serial TX to stdout, stdin to serial RX;\n"
             "               stops on Ctrl-C, a breakpoint, or after -H SECONDS\n"
             "  --speed X    with --serial: speed factor (1 = real time, 0 = as fast as possible)\n"
-            "  --hold-speed X  speed while 's' is held down in the TUI (default 0.001; 0 = the current speed)\n"
+            "  --hold-speed X  speed while 's' is held down in the TUI (default 0.0001; 0 = the current speed)\n"
             "  -H SECONDS   headless: run SECONDS of simulated time as fast as possible, serial to stdout\n"
             "  -i TEXT      (headless/serial) bytes to send to the serial RX line at start\n"
             "  -b WHERE     breakpoint: function | file:line | 0xADDR (repeatable)\n"
@@ -2654,7 +2654,7 @@ int main(int argc, char **argv) {
     std::string inject, file;
     std::vector<std::string> bps, dirs;
     bool start_paused = false, serial_only = false;
-    double speed = 1, hold_speed = 0.001;
+    double speed = 1, hold_speed = 0.0001;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "-H" && i + 1 < argc) hsecs = atof(argv[++i]);
