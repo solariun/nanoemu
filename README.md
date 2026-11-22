@@ -13,7 +13,7 @@ An **Arduino Nano (ATmega328P @ 16 MHz) emulator** with a full terminal UI. It's
 │ live disasm    │├─ SERIAL  115200 baud  pty /dev/ttys004 ──────────────┤│                     │
 │                ││ serial console + input line                          ││                     │
 └────────────────┘└──────────────────────────────────────────────────────┘└─────────────────────┘
-┌─ OSCILLOSCOPE  (logic analyzer, freq + duty per channel, trigger) ─────────────────────────────┐
+┌─ LOGIC ANALYZER  (all 20 digital pins, freq + duty per pin, time cursor, trigger) ──────────────┐
 │ D6  PWM  976.6Hz 25%  ┌┐   ┌┐   ┌┐   ┌┐   ┌┐   ┌┐   ┌┐   ┌┐   ┌┐   ┌┐   ┌┐   ┌┐   ┌┐   ┌┐       │
 │                     ──┘└───┘└───┘└───┘└───┘└───┘└───┘└───┘└───┘└───┘└───┘└───┘└───┘└───       │
 └────────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -39,6 +39,8 @@ c++ -std=c++11 -O2 -o nanoemu nanoemu.cpp -lncurses
 ./nanoemu sketch.ino.elf          # ELF from avr-gcc / arduino-cli
 ./nanoemu -b loop sketch.ino.elf  # source view + stop when loop() is reached
 ./nanoemu -b main.ino:42 -b 0x1a4 firm.elf   # breakpoints by file:line or byte address
+./nanoemu --serial firm.hex       # no TUI: real time, serial ↔ stdin/stdout, Ctrl-C stops
+./nanoemu -c --speed 0 -H 5 firm.hex  # the same, as fast as possible, stop after 5 simulated s
 ./nanoemu -H 2 -i "ping" firm.hex # headless: 2 s simulated, serial → stdout (good for CI)
 ```
 
@@ -57,13 +59,14 @@ Use a terminal of at least 110×34. 180×50 or larger looks best.
 | `v` | show/hide the source panel |
 | `a` | SOURCE panel: also show Arduino's internal code (core, libraries, avr-libc). Hidden by default |
 | `+` / `-` | simulation speed: x0.001 … x10, or max |
-| `[` / `]` | oscilloscope timebase (1 µs … 100 ms per column) |
-| `t` | toggle the scope trigger (rising edge of the first channel) |
-| `↑` `↓` | select a pin in the PINS panel |
-| `ENTER` | cycle the selected pin's external drive: float → HIGH → LOW |
-| `←` `→` | analog pins: change the ADC voltage. Digital pins: drive LOW/HIGH |
-| `o` | add/remove the selected pin on the oscilloscope |
-| `TAB` | type into the serial port (ENTER sends the line + `\n`, ESC leaves) |
+| `TAB` | move keyboard focus between the PINS panel and the LOGIC ANALYZER (the focused panel's border lights up) |
+| `↑` `↓` | select a pin, in either panel. The selection is shared |
+| `ENTER` | (PINS) cycle the selected pin's external drive: float → HIGH → LOW |
+| `←` `→` | (PINS) analog pins: change the ADC voltage. Digital pins: drive LOW/HIGH |
+| `←` `→` | (LOGIC ANALYZER) move the time cursor; `ESC` hides it |
+| `[` / `]` | logic analyzer timebase (1 µs … 100 ms per column) |
+| `t` | trigger the logic analyzer on the selected pin's rising edge |
+| `i` | type into the serial port (ENTER sends the line + `\n`, ESC leaves) |
 | `c` | clear the serial console |
 | `q` | quit |
 

@@ -35,6 +35,8 @@
 #include <locale.h>
 #include <termios.h>
 #include <time.h>
+#include <poll.h>
+#include <signal.h>
 #include <unistd.h>
 #ifdef __APPLE__
 #include <util.h>
@@ -1517,8 +1519,9 @@ public:
     bool quit = false;
     int speed_i = 5, tb_i = 5;
     bool trigger = false;
+    enum Focus { F_PINS, F_SCOPE } focus = F_PINS; // TAB switches where the arrow keys go
+    int tcur = -1;                                  // analyzer time cursor: columns left of "now", -1 = hidden
     int sel = 13;
-    std::vector<int> scope = {13, 1, 3, 5, 6, 9, 10, 11};
     enum Mode { NORMAL, SERIAL, PROMPT_FILE, PROMPT_BREAK } mode = NORMAL;
     // debugger
     DebugInfo dbg;
@@ -1872,7 +1875,7 @@ public:
             end = start;
         }
         for (int i = 0; i < (int)rows.size(); i++) put(y + ih - i, x + 1, iw, COLOR_PAIR(K_HI + 20), rows[i]);
-        std::string pr = mode == SERIAL ? "> " + input + "_" : "  TAB: type to serial   c: clear";
+        std::string pr = mode == SERIAL ? "> " + input + "_" : "  i: type to serial   ESC: stop typing   c: clear";
         put(y + h - 2, x + 1, iw, mode == SERIAL ? (COLOR_PAIR(C_WARN) | A_BOLD) : COLOR_PAIR(C_DIMTXT), pr);
     }
     double ram_baud() { return (m.ram[UCSR0B] & 0x18) ? m.baud() : 0; }
@@ -1931,7 +1934,7 @@ public:
         int iw = w - 2;
         int ph = std::min(h - 12, 25);
         if (ph < 5) ph = std::max(3, h - 3);
-        box_at(y, x, ph, w, "PINS  ↑↓ ⏎ ←→ o");
+        box_at(y, x, ph, w, "PINS  \u2191\u2193 \u23CE \u2190\u2192  TAB", focus == F_PINS);
         put(y + 1, x + 1, iw, COLOR_PAIR(C_DIMTXT) | A_UNDERLINE, " PIN  PRT MODE  LV DRV  ANALOG     ");
         int vis = ph - 3, off = 0;
         if (sel >= vis) off = sel - vis + 1;
@@ -1944,9 +1947,6 @@ public:
                 s = strf("%c%-4s P%c%d %-5s %d  %s", i == sel ? '>' : ' ', PIN_NAME[i], "BCD"[pin_port(i)], pin_bit(i),
                          m.pin_mode(i).c_str(), m.level(i), drv);
                 if (i >= 14) s += strf("  %4d %.2fV", m.adcv[i - 14], m.adcv[i - 14] * 5.0 / 1023);
-                bool insc = false;
-                for (size_t j = 0; j < scope.size(); j++) if (scope[j] == i) insc = true;
-                if (insc) s += std::string(std::max(0, 34 - (int)s.size()), ' ') + "~";
                 k = pin_kind(i);
             } else {
                 int ch = i - 14;
@@ -1992,59 +1992,76 @@ public:
         for (int i = 0; i < (int)L.size() && i < phh - 2; i++) put(py + 1 + i, x + 1, iw, L[i].second, " " + L[i].first);
     }
 
+    // Logic analyzer: all 20 digital pins, D0..D9 on the left half, D10..D13 and A0..A5 on the right,
+    // one row each. High is a raised bar, low a baseline, an edge a vertical bar, faster activity a shade.
+    static const char *short_mode(const std::string &md) { return md == "IN_PU" ? "PU" : md.c_str(); }
     void draw_scope(int y, int x, int w, int h) {
         double us = TIMEBASES[tb_i];
-        int lw = 20, tw = w - 2 - lw;
-        if (tw < 10) return;
+        const int lw = 19;
+        int half = (w - 2) / 2, tw = half - lw - 3;
+        if (tw < 8 || h < 4) return;
         uint64_t cpc = (uint64_t)(us * 16); // cycles per column
         uint64_t win = cpc * tw;
         uint64_t tend = m.cycles;
         std::string trig = "off";
-        if (trigger && !scope.empty()) {
-            int p = scope[0];
+        if (trigger && sel < NPINS) {
+            int p = sel;
             trig = strf("%s rising", PIN_NAME[p]);
             uint64_t lim = tend > win * 9 / 10 ? tend - win * 9 / 10 : 0;
             uint64_t k = m.log_idx(p, lim), oldest = m.pcount[p] > PLOG ? m.pcount[p] - PLOG : 0;
             while (k > oldest) { k--; if (m.ev_lvl(p, k)) { tend = m.ev_cyc(p, k) + win * 9 / 10; break; } }
-        }
+        } else if (trigger) trig = "(select a pin)";
         uint64_t t0 = tend > win ? tend - win : 0;
-        box_at(y, x, h, w, strf("OSCILLOSCOPE  %s/div(10col)  window %s  trig %s   [ ] timebase  t trigger  o add/remove",
-                                fmt_time(us * 1e-5).c_str(), fmt_time(win / F_CPU).c_str(), trig.c_str()));
-        int nch = std::min((int)scope.size(), (h - 3) / 2);
-        for (int c = 0; c < nch; c++) {
-            int p = scope[c], ry = y + 1 + c * 2;
+        if (tcur >= tw) tcur = tw - 1;
+        int ccol = tcur >= 0 ? tw - 1 - tcur : -1; // cursor column inside each half
+        std::string cur = ccol >= 0 ? strf("  cursor %s", fmt_time(-(double)(tw - ccol) * cpc / F_CPU).c_str()) : "";
+        box_at(y, x, h, w, strf("LOGIC ANALYZER  %s/col  window %s  trigger %s%s   TAB focus  ↑↓ pin  ←→ cursor  [ ] timebase  t trigger",
+                                fmt_time(us * 1e-6).c_str(), fmt_time(win / F_CPU).c_str(), trig.c_str(), cur.c_str()),
+               focus == F_SCOPE);
+        int rows = std::min(10, h - 3);
+        attron(COLOR_PAIR(C_BORDER) | A_DIM);
+        mvvline(y + 1, x + 1 + half - 1, ACS_VLINE, rows + 1);
+        attroff(COLOR_PAIR(C_BORDER) | A_DIM);
+        for (int i = 0; i < NPINS; i++) {
+            int row = i % 10;
+            if (row >= rows) continue;
+            int bx = x + 1 + (i / 10) * half, ry = y + 1 + row;
             double f, du;
-            m.measure(p, t0, tend, f, du);
-            int k = pin_kind(p);
-            put(ry, x + 1, lw, COLOR_PAIR(kp(k, false)) | A_BOLD, strf(" %-4s %-4s", PIN_NAME[p], m.pin_mode(p).c_str()));
-            std::string fs = f >= 1000 ? strf("%.2fkHz", f / 1000) : f > 0 ? strf("%.1fHz", f) : std::string("-");
-            put(ry + 1, x + 1, lw, COLOR_PAIR(C_DIMTXT), strf(" %-9s %3d%%", fs.c_str(), (int)lround(du * 100)));
-            int tc = (c % 2) ? kp(K_INHI, false) : kp(K_HI, false);
+            m.measure(i, t0, tend, f, du);
+            std::string md = m.pin_mode(i);
+            std::string fs = f >= 10000 ? strf("%.0fk", f / 1000) : f >= 1000 ? strf("%.1fk", f / 1000)
+                           : f > 0 ? strf("%.0f", f) : std::string("-");
+            int k = pin_kind(i);
+            std::string lab = strf("%-3s %-3s %5s %3d%%", PIN_NAME[i], short_mode(md), fs.c_str(), (int)lround(du * 100));
+            put(ry, bx, lw, i == sel ? (COLOR_PAIR(C_SEL) | A_BOLD) : (COLOR_PAIR(kp(k, false)) | A_BOLD), lab);
             for (int col = 0; col < tw; col++) {
-                uint64_t a = tend - win + (uint64_t)col * cpc;
                 if (tend < win && (uint64_t)col * cpc < win - tend) continue; // before t=0
-                uint64_t b2 = a + cpc;
-                int s0 = m.level_at(p, a), s1 = m.level_at(p, b2);
-                uint64_t n = m.log_idx(p, b2) - m.log_idx(p, a);
-                const char *top = " ", *bot = " ";
-                if (n == 0) { if (s0) top = "─"; else bot = "─"; }
-                else if (n == 1) { if (s1) { top = "┌"; bot = "┘"; } else { top = "┐"; bot = "└"; } }
-                else if (n == 2) { if (s0) { top = "┴"; bot = "│"; } else { top = "│"; bot = "┬"; } } // short pulse
-                else { top = "▓"; bot = "▓"; }
-                uput(ry, x + 1 + lw + col, COLOR_PAIR(tc) | A_BOLD, top);
-                uput(ry + 1, x + 1 + lw + col, COLOR_PAIR(tc) | A_BOLD, bot);
+                uint64_t a = tend - win + (uint64_t)col * cpc, b2 = a + cpc;
+                uint64_t n = m.log_idx(i, b2) - m.log_idx(i, a);
+                const char *g;
+                int attr = COLOR_PAIR(kp(k, false)) | A_BOLD;
+                if (n == 0) {
+                    if (m.level_at(i, a)) g = "▀";                   // high
+                    else { g = "▁"; attr = COLOR_PAIR(kp(k, false)) | A_DIM; } // low
+                } else if (n <= 2) g = "│";                          // edge / short pulse
+                else g = "▒";                                        // toggling faster than a column
+                if (col == ccol) attr = (attr & ~A_DIM) | A_REVERSE;
+                uput(ry, bx + lw + 1 + col, attr, g);
             }
         }
-        // time axis
-        int ay = y + 1 + nch * 2;
-        if (ay < y + h - 1) {
-            for (int col = 0; col < tw; col += 10) {
-                double rel = -(double)(tw - col) * cpc / F_CPU;
-                uput(ay, x + 1 + lw + col, COLOR_PAIR(C_DIMTXT), "╵");
-                put(ay, x + 2 + lw + col, 9, COLOR_PAIR(C_DIMTXT) | A_DIM, fmt_time(rel));
+        // time axis under both halves
+        int ay = y + 1 + rows;
+        if (ay < y + h - 1)
+            for (int hlf = 0; hlf < 2; hlf++) {
+                int bx = x + 1 + hlf * half;
+                put(ay, bx, lw, COLOR_PAIR(C_DIMTXT), trigger ? " t=trigger-10%" : " t=now");
+                for (int col = 0; col + 8 < tw; col += 10) {
+                    double rel = -(double)(tw - col) * cpc / F_CPU;
+                    uput(ay, bx + lw + 1 + col, COLOR_PAIR(C_DIMTXT), "╵");
+                    put(ay, bx + lw + 2 + col, 8, COLOR_PAIR(C_DIMTXT) | A_DIM, fmt_time(rel));
+                }
+                if (ccol >= 0) uput(ay, bx + lw + 1 + ccol, COLOR_PAIR(C_WARN) | A_BOLD, "▲");
             }
-            put(ay, x + 1, lw, COLOR_PAIR(C_DIMTXT), trigger ? " t=trigger-10%" : " t=now");
-        }
     }
 
     void draw() {
@@ -2066,8 +2083,7 @@ public:
         uput(0, 0, COLOR_PAIR(C_TITLE) | A_BOLD, top.c_str());
         if (!msg.empty() && now - msg_t < 6) put(0, W - std::min(W / 2, (int)msg.size() + 2), W / 2, COLOR_PAIR(C_TITLE), msg);
 
-        int nch = std::max(1, std::min((int)scope.size(), (H - 36) / 2 + 3));
-        int SH = std::max(5, nch * 2 + 3);
+        int SH = H >= 45 ? 13 : std::max(5, H - 32); // 10 channel rows + axis + borders
         int LW = 30, RW = 38, MW = W - LW - RW;
         int MH = H - 2 - SH;
         draw_cpu(1, 0, LW, MH);
@@ -2082,7 +2098,7 @@ public:
         // key bar
         const char *keys[][2] = {{"SPC", "run/pause"}, {"s", "step"}, {"r", "restart"}, {"l", "reload"}, {"f", "open"},
                                  {"b", "breakpt"}, {"v", "source"}, {"a", "internal"}, {"+-", "speed"}, {"[]", "timebase"}, {"t", "trig"}, {"⏎←→", "drive"},
-                                 {"o", "scope"}, {"TAB", "serial"}, {"q", "quit"}};
+                                 {"TAB", "focus"}, {"i", "serial"}, {"q", "quit"}};
         int kx = 0;
         move(H - 1, 0);
         clrtoeol();
@@ -2107,7 +2123,7 @@ public:
     // -------------------------------------------------------------- input
     void handle_key(int ch) {
         if (mode != NORMAL) {
-            if (ch == 27 || (ch == '\t' && mode == SERIAL)) { mode = NORMAL; input.clear(); return; }
+            if (ch == 27) { mode = NORMAL; input.clear(); return; }
             if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) { if (!input.empty()) input.erase(input.size() - 1); return; }
             if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
                 if (mode == SERIAL) { send_serial(input + "\n"); input.clear(); return; }
@@ -2142,23 +2158,22 @@ public:
         case '[': if (tb_i > 0) tb_i--; break;
         case 't': trigger = !trigger; break;
         case 'c': stext.clear(); break;
-        case '\t': case 'i': mode = SERIAL; input.clear(); break;
+        case 'i': mode = SERIAL; input.clear(); break;
+        case '\t': focus = focus == F_PINS ? F_SCOPE : F_PINS; break;
+        case 27: tcur = -1; break;
         case KEY_UP: case 'k': if (sel > 0) sel--; break;
-        case KEY_DOWN: case 'j': if (sel < 21) sel++; break;
+        case KEY_DOWN: case 'j': if (sel < (focus == F_SCOPE ? NPINS - 1 : 21)) sel++; break;
         case '\n': case '\r': case KEY_ENTER:
             if (sel < NPINS) { m.ext[sel] = m.ext[sel] < 0 ? 1 : m.ext[sel] == 1 ? 0 : -1; m.pins_changed(); }
             break;
         case KEY_LEFT: case KEY_RIGHT: case 'h': case ',': case '.': {
             int dir = (ch == KEY_RIGHT || ch == '.') ? 1 : -1;
+            if (focus == F_SCOPE) { // time cursor: left goes back in time
+                tcur = tcur < 0 ? 0 : std::max(0, tcur - dir);
+                break;
+            }
             if (sel >= 14) { int a = sel - 14; m.adcv[a] = (uint16_t)std::max(0, std::min(1023, m.adcv[a] + dir * 32)); }
             else { m.ext[sel] = dir > 0 ? 1 : 0; m.pins_changed(); }
-            break;
-        }
-        case 'o': {
-            if (sel >= NPINS) break;
-            bool found = false;
-            for (size_t j = 0; j < scope.size(); j++) if (scope[j] == sel) { scope.erase(scope.begin() + j); found = true; break; }
-            if (!found) { if (scope.size() >= 10) scope.erase(scope.begin()); scope.push_back(sel); }
             break;
         }
         default: break;
@@ -2237,9 +2252,13 @@ public:
         double t0 = mono();
         while (m.cycles < end && !m.paused) { m.run_until(std::min(end, m.cycles + 100000)); now = mono(); drain_tx(); }
         drain_tx();
-        double el = mono() - t0;
+        print_stats(mono() - t0);
+        return 0;
+    }
+
+    void print_stats(double el) {
         fprintf(stderr, "\n--- nanoemu: %.3f s simulated in %.3f s (%.1fx realtime), %llu instructions\n",
-                m.cycles / F_CPU, el, m.cycles / F_CPU / el, (unsigned long long)m.instrs);
+                m.cycles / F_CPU, el, el > 0 ? m.cycles / F_CPU / el : 0.0, (unsigned long long)m.instrs);
         if (!m.event.empty()) fprintf(stderr, "--- %s\n", m.event.c_str());
         fprintf(stderr, "--- pins:");
         for (int i = 0; i < NPINS; i++) {
@@ -2248,15 +2267,54 @@ public:
             fprintf(stderr, " %s=%d%s", PIN_NAME[i], m.level(i), f > 0 ? strf("(%.0fHz,%d%%)", f, (int)lround(d * 100)).c_str() : "");
         }
         fprintf(stderr, "\n");
+    }
+
+    // serial only, no TUI: real-time run, UART TX -> stdout, stdin -> UART RX, until Ctrl-C
+    // (or SECS simulated seconds, or a breakpoint). speed 0 = as fast as possible.
+    static volatile sig_atomic_t stop_req;
+    static void on_sigint(int) { stop_req = 1; }
+    int run_serial(double secs, double speed, const std::string &inject) {
+        headless = true;
+        stop_req = 0;
+        signal(SIGINT, on_sigint);
+        signal(SIGTERM, on_sigint);
+        if (!inject.empty()) send_serial(inject);
+        uint64_t end = secs > 0 ? (uint64_t)(secs * F_CPU) : UINT64_MAX;
+        bool in_open = true;
+        double t0 = mono(), last = t0;
+        while (!stop_req && m.cycles < end && !m.paused) {
+            now = mono();
+            double dt = std::min(now - last, 0.1);
+            last = now;
+            uint64_t target = speed > 0 ? m.cycles + (uint64_t)(dt * F_CPU * speed) : m.cycles + 400000;
+            m.run_until(std::min(end, target));
+            drain_tx();
+            if (in_open) { // stdin -> RX
+                pollfd pfd = {0, POLLIN, 0};
+                if (poll(&pfd, 1, 0) > 0) {
+                    char b[256];
+                    ssize_t n = read(0, b, sizeof b);
+                    if (n > 0) send_serial(std::string(b, n));
+                    else in_open = false; // EOF: keep running, stop reading
+                }
+            }
+            if (speed > 0) usleep(2000);
+        }
+        drain_tx();
+        print_stats(mono() - t0);
         return 0;
     }
 };
+volatile sig_atomic_t App::stop_req = 0;
 
 static void usage(const char *p) {
     fprintf(stderr,
             "usage: %s [options] firmware.{bin,hex,elf}\n"
-            "  -H SECONDS   headless: run SECONDS of simulated time, print serial to stdout\n"
-            "  -i TEXT      (headless) bytes to send to the serial RX line at start\n"
+            "  -c, --serial run without the TUI, in real time: serial TX to stdout, stdin to serial RX;\n"
+            "               stops on Ctrl-C, a breakpoint, or after -H SECONDS\n"
+            "  --speed X    with --serial: speed factor (1 = real time, 0 = as fast as possible)\n"
+            "  -H SECONDS   headless: run SECONDS of simulated time as fast as possible, serial to stdout\n"
+            "  -i TEXT      (headless/serial) bytes to send to the serial RX line at start\n"
             "  -b WHERE     breakpoint: function | file:line | 0xADDR (repeatable)\n"
             "  -S DIR       extra directory to search for source files (repeatable)\n"
             "  -p           start paused\n",
@@ -2267,7 +2325,8 @@ int main(int argc, char **argv) {
     static App app; // large (pin logs); keep off the stack
     double hsecs = -1;
     std::string inject, file;
-    bool start_paused = false;
+    bool start_paused = false, serial_only = false;
+    double speed = 1;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "-H" && i + 1 < argc) hsecs = atof(argv[++i]);
@@ -2275,6 +2334,8 @@ int main(int argc, char **argv) {
         else if (a == "-b" && i + 1 < argc) app.bp_specs.push_back(argv[++i]);
         else if (a == "-S" && i + 1 < argc) app.src_dirs.push_back(argv[++i]);
         else if (a == "-p") start_paused = true;
+        else if (a == "-c" || a == "--serial") serial_only = true;
+        else if (a == "--speed" && i + 1 < argc) speed = atof(argv[++i]);
         else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
         else if (a[0] == '-') { usage(argv[0]); return 1; }
         else file = a;
@@ -2282,6 +2343,10 @@ int main(int argc, char **argv) {
     if (!file.empty() && !app.load(file)) {
         fprintf(stderr, "%s\n", app.msg.c_str());
         return 1;
+    }
+    if (serial_only) {
+        if (file.empty()) { usage(argv[0]); return 1; }
+        return app.run_serial(hsecs, speed, inject);
     }
     if (hsecs >= 0) {
         if (file.empty()) { usage(argv[0]); return 1; }

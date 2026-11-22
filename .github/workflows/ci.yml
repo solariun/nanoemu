@@ -48,3 +48,10 @@ jobs:
         ./nanoemu -H 2 -b demo.ino:24 examples/demo/demo.elf > out.txt 2> stats.txt || true
         cat stats.txt
         grep -q "breakpoint at" stats.txt
+
+    - name: Serial-only mode (real time, stdin to RX)
+      run: |
+        ( sleep 1; printf 'hello\n'; sleep 1 ) | ./nanoemu --serial -H 1.8 examples/demo/demo.hex > out.txt 2> stats.txt
+        cat out.txt stats.txt
+        grep -q "HELLO" out.txt
+        grep -q "1.800 s simulated" stats.txt
