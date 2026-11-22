@@ -1594,7 +1594,7 @@ static const HPin TOP_HDR[15] = {{"D12", 12}, {"D11", 11}, {"D10", 10}, {"D9", 9
 static const HPin BOT_HDR[15] = {{"D13", 13}, {"3V3", -3}, {"REF", -4}, {"A0", 14}, {"A1", 15}, {"A2", 16}, {"A3", 17},
                                  {"A4", 18}, {"A5", 19}, {"A6", -10}, {"A7", -11}, {"5V", -5}, {"RST", -2}, {"GND", -1}, {"VIN", -6}};
 
-static const double SPEEDS[] = {0.001, 0.01, 0.1, 0.25, 0.5, 1, 2, 4, 10, 0};
+static const double SPEEDS[] = {0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 10, 0};
 static const int NSPEEDS = sizeof SPEEDS / sizeof SPEEDS[0];
 static const double TIMEBASES[] = {1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000}; // us/column
 static const int NTB = sizeof TIMEBASES / sizeof TIMEBASES[0];
@@ -1605,7 +1605,7 @@ public:
     std::string fw_path;
     int fw_size = 0;
     bool quit = false;
-    int speed_i = 5, tb_i = 6;
+    int speed_i = 9, tb_i = 6; // x1, 100 us per column
     bool trigger = false;
     enum Focus { F_PINS, F_SCOPE } focus = F_PINS; // TAB switches where the arrow keys go
     int tcur = -1;                                  // analyzer time cursor: columns left of "now", -1 = hidden

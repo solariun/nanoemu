@@ -58,7 +58,7 @@ Use a terminal of at least 110×34. 180×50 or larger looks best.
 | `b` | toggle a breakpoint: `function`, `file:line`, `line` (in the current file) or `0xADDR`. Empty input clears all of them |
 | `v` | show/hide the source panel |
 | `a` | SOURCE panel: also show Arduino's internal code (core, libraries, avr-libc). Hidden by default |
-| `+` / `-` | simulation speed: x0.001 … x10, or max |
+| `+` / `-` | simulation speed: x0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1 (default), 2, 4, 10, or max |
 | `TAB` | move keyboard focus between the PINS panel and the LOGIC ANALYZER (the focused panel's border lights up) |
 | `↑` `↓` | select a pin, in either panel. The selection is shared |
 | `ENTER` | (PINS) cycle the selected pin's external drive: float → HIGH → LOW |
