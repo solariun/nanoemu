@@ -1,4 +1,5 @@
 // nanoemu - Arduino Nano (ATmega328P @ 16 MHz) emulator with a terminal UI.
+// Also runs the ATtiny2313 / ATtiny2313A (--mcu attiny2313); --freq sets the clock.
 //
 // Single file, C++11 + ncurses.
 //   macOS : c++ -std=c++11 -O2 -o nanoemu nanoemu.cpp -lncurses
@@ -51,16 +52,34 @@
 //  Constants & helpers
 // ============================================================================
 
-static const double F_CPU = 16000000.0;
-// Memory sizes: the ATmega328P's by default; --flash / --ram enlarge them for tests (set before Nano is built)
-static int FLASH_WORDS = 16384;        // 32 KB
-static uint32_t PC_MASK = 0x3FFF;      // FLASH_WORDS - 1
-static int RAM_END = 0x900;            // regs + IO + 2 KB SRAM
-static const int RAM_END_328P = 0x900; // the stack top the firmware's startup code sets (RAMEND + 1)
-static const int BOOT_BYTES = 2048;    // the Nano's bootloader section at the top of flash
-static const int EE_SIZE = 1024;
-static const int NPINS = 20;           // D0..D13, A0..A5
+static double F_CPU = 16000000.0; // --freq
+
+enum McuType { MCU_ATMEGA328P = 0, MCU_ATTINY2313 };
+
+static const int MAX_PINS = 20;
 static const uint32_t PLOG = 1u << 17; // pin-toggle history per pin
+
+// What differs between the supported chips (data-space addresses)
+struct McuConfig {
+    McuType type;
+    const char *display_name;
+    int flash_words;
+    uint32_t pc_mask;
+    int ram_start, ram_end; // first SRAM address, RAMEND + 1
+    int ee_size;
+    int boot_bytes;
+    int npins;
+    bool has_sph, has_adc;
+    int num_timers;
+    int num_irqs;
+    const char *const *irq_names;
+    const char *const *pin_names;
+    const char *port_letters; // per port index
+    int a_ddr[3], a_port[3];
+    int ucsra, ucsrb, ucsrc, ubrrl, ubrrh;
+    int eecr, eedr, eearl, eearh;
+    int wdtcsr, mcusr;
+};
 
 enum { FC = 1, FZ = 2, FN = 4, FV = 8, FS = 16, FH = 32, FT = 64, FI = 128 };
 
@@ -100,27 +119,86 @@ static std::string fmt_time(double s) {
     return strf("%.3gus", s * 1e6);
 }
 
-static const char *IRQ_NAMES[26] = {
+static const char *IRQ_NAMES_328P[26] = {
     "RESET", "INT0", "INT1", "PCINT0", "PCINT1", "PCINT2", "WDT",
     "TIMER2_COMPA", "TIMER2_COMPB", "TIMER2_OVF", "TIMER1_CAPT",
     "TIMER1_COMPA", "TIMER1_COMPB", "TIMER1_OVF", "TIMER0_COMPA",
     "TIMER0_COMPB", "TIMER0_OVF", "SPI_STC", "USART_RX", "USART_UDRE",
     "USART_TX", "ADC", "EE_READY", "ANALOG_COMP", "TWI", "SPM_READY"};
 
-// Arduino pin <-> port mapping (port index: 0=B, 1=C, 2=D)
-static const char *PIN_NAME[NPINS] = {
+static const char *IRQ_NAMES_2313[19] = {
+    "RESET", "INT0", "INT1", "TIMER1_CAPT", "TIMER1_COMPA", "TIMER1_OVF",
+    "TIMER0_OVF", "USART_RX", "USART_UDRE", "USART_TX", "ANALOG_COMP",
+    "PCINT", "TIMER1_COMPB", "TIMER0_COMPA", "TIMER0_COMPB", "USI_START",
+    "USI_OVERFLOW", "EE_READY", "WDT_OVERFLOW"};
+
+static const char *PIN_NAME_328P[20] = {
     "D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "D9",
     "D10", "D11", "D12", "D13", "A0", "A1", "A2", "A3", "A4", "A5"};
-static int pin_port(int i) { return i < 8 ? 2 : i < 14 ? 0 : 1; }
-static int pin_bit(int i) { return i < 8 ? i : i < 14 ? i - 8 : i - 14; }
-static int port_pin(int p, int b) {
-    if (p == 2) return b;
-    if (b >= 6) return -1;
-    return p == 0 ? 8 + b : 14 + b;
+
+static const char *PIN_NAME_2313[18] = {
+    "D0", "D1", "D2", "D3", "D4", "D5", "D6",
+    "D7", "D8", "D9", "D10", "D11", "D12", "D13", "D14",
+    "D15", "D16", "D17"};
+
+// The ATtiny2313A runs on the ATtiny2313 model: the extra PCINT vectors of the A are not emulated
+static const McuConfig MCU_CONFIGS[2] = {
+    {MCU_ATMEGA328P, "ATmega328P", 16384, 0x3FFF, 0x0100, 0x0900, 1024, 2048, 20, true, true, 3, 26,
+     IRQ_NAMES_328P, PIN_NAME_328P, "BCD", {0x24, 0x27, 0x2A}, {0x25, 0x28, 0x2B},
+     0xC0, 0xC1, 0xC2, 0xC4, 0xC5, 0x3F, 0x40, 0x41, 0x42, 0x60, 0x54},
+    {MCU_ATTINY2313, "ATtiny2313", 1024, 0x03FF, 0x0060, 0x00E0, 128, 0, 18, false, false, 2, 19,
+     IRQ_NAMES_2313, PIN_NAME_2313, "BAD", {0x37, 0x3A, 0x31}, {0x38, 0x3B, 0x32},
+     0x2B, 0x2A, 0x23, 0x29, 0x22, 0x3C, 0x3D, 0x3E, 0, 0x41, 0x54},
+};
+
+// Memory sizes: the chip's own; --flash / --ram enlarge them for tests (set before Nano is built)
+static const McuConfig *mcu = &MCU_CONFIGS[0];
+static int FLASH_WORDS = 16384;
+static uint32_t PC_MASK = 0x3FFF;
+static int SRAM_START = 0x0100;
+static int RAM_END = 0x0900;
+static int RAM_END_DEFAULT = 0x0900; // the stack top the firmware's startup code sets (RAMEND + 1)
+static int BOOT_BYTES = 2048;
+
+static void set_mcu(McuType type) {
+    mcu = &MCU_CONFIGS[(int)type];
+    FLASH_WORDS = mcu->flash_words;
+    PC_MASK = mcu->pc_mask;
+    SRAM_START = mcu->ram_start;
+    RAM_END = RAM_END_DEFAULT = mcu->ram_end;
+    BOOT_BYTES = mcu->boot_bytes;
 }
 
-static int A_DDR(int p) { return 0x24 + 3 * p; }
-static int A_PORT(int p) { return 0x25 + 3 * p; }
+static int find_mcu(std::string l) {
+    for (size_t i = 0; i < l.size(); i++) l[i] = tolower((unsigned char)l[i]);
+    if (l == "atmega328p" || l == "nano") return MCU_ATMEGA328P;
+    if (l == "attiny2313" || l == "attiny2313a") return MCU_ATTINY2313;
+    return -1;
+}
+
+// Pin <-> port mapping (port index: 0=B, 1=C, 2=D on the Nano; 0=B, 1=A, 2=D on the ATtiny2313,
+// whose pins 0..6 are PD0..PD6, 7..14 PB0..PB7, 15..17 PA0..PA2)
+static int pin_port(int i) {
+    if (mcu->type == MCU_ATMEGA328P) return i < 8 ? 2 : i < 14 ? 0 : 1;
+    return i < 7 ? 2 : i < 15 ? 0 : 1;
+}
+static int pin_bit(int i) {
+    if (mcu->type == MCU_ATMEGA328P) return i < 8 ? i : i < 14 ? i - 8 : i - 14;
+    return i < 7 ? i : i < 15 ? i - 7 : i - 15;
+}
+static int port_pin(int p, int b) {
+    if (mcu->type == MCU_ATMEGA328P) {
+        if (p == 2) return b;
+        if (b >= 6) return -1;
+        return p == 0 ? 8 + b : 14 + b;
+    }
+    if (p == 2) return b <= 6 ? b : -1;
+    if (p == 0) return 7 + b;
+    return b <= 2 ? 15 + b : -1;
+}
+
+static int A_DDR(int p) { return mcu->a_ddr[p]; }
+static int A_PORT(int p) { return mcu->a_port[p]; }
 
 // ============================================================================
 //  The microcontroller
@@ -133,7 +211,7 @@ public:
     std::vector<uint8_t> ram;
     std::vector<uint8_t> touched;  // per SRAM byte: written at least once since reset
     uint16_t min_sp = 0xFFFF;      // lowest stack pointer seen since reset (stack peak)
-    uint8_t eeprom[EE_SIZE];
+    uint8_t eeprom[1024];
     uint16_t pc = 0;
     uint64_t cycles = 0, instrs = 0;
     bool sleeping = false, irq_inhibit = false;
@@ -150,10 +228,10 @@ public:
     uint8_t lv[3] = {0, 0, 0};       // level on the wire per port
     uint8_t ovr_mask[3] = {0, 0, 0}; // peripheral-driven bits
     uint8_t ovr_val[3] = {0, 0, 0};
-    int8_t ext[NPINS];               // external drive: -1 float, 0, 1
+    int8_t ext[MAX_PINS];               // external drive: -1 float, 0, 1
     uint16_t adcv[8] = {512, 256, 768, 1023, 0, 100, 600, 900};
-    std::vector<uint64_t> plog[NPINS]; // (cycle<<1)|level, ring
-    uint64_t pcount[NPINS] = {0};
+    std::vector<uint64_t> plog[MAX_PINS]; // (cycle<<1)|level, ring
+    uint64_t pcount[MAX_PINS] = {0};
 
     // ---- timers ----
     enum { K_NORMAL, K_CTC, K_FAST, K_PC };
@@ -166,6 +244,8 @@ public:
         uint32_t pre;
         int dir;
         uint8_t oc;
+        uint8_t flag_a, flag_b, flag_ovf;
+        uint8_t icr;
     };
     Timer tm[3];
     uint8_t t16temp = 0;
@@ -193,15 +273,21 @@ public:
     Nano() {
         static const uint16_t div01[8] = {0, 1, 8, 64, 256, 1024, 0, 0};
         static const uint16_t div2[8] = {0, 1, 8, 32, 64, 128, 256, 1024};
-        Timer t0 = {"T0", false, 0x44, 0x45, 0x46, 0x47, 0x48, TIMSK0, TIFR0, 2, 6, 2, 5, div01, 0, 1, 0};
-        Timer t1 = {"T1", true, 0x80, 0x81, 0x84, 0x88, 0x8A, TIMSK1, TIFR1, 0, 1, 0, 2, div01, 0, 1, 0};
-        Timer t2 = {"T2", false, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4, TIMSK2, TIFR2, 0, 3, 2, 3, div2, 0, 1, 0};
-        tm[0] = t0; tm[1] = t1; tm[2] = t2;
+        if (mcu->type == MCU_ATMEGA328P) {
+            Timer t0 = {"T0", false, 0x44, 0x45, 0x46, 0x47, 0x48, TIMSK0, TIFR0, 2, 6, 2, 5, div01, 0, 1, 0, 2, 4, 1, 0};
+            Timer t1 = {"T1", true, 0x80, 0x81, 0x84, 0x88, 0x8A, TIMSK1, TIFR1, 0, 1, 0, 2, div01, 0, 1, 0, 2, 4, 1, 0x86};
+            Timer t2 = {"T2", false, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4, TIMSK2, TIFR2, 0, 3, 2, 3, div2, 0, 1, 0, 2, 4, 1, 0};
+            tm[0] = t0; tm[1] = t1; tm[2] = t2;
+        } else {
+            Timer t0 = {"T0", false, 0x50, 0x53, 0x52, 0x56, 0x5C, 0x59, 0x58, 0, 2, 2, 5, div01, 0, 1, 0, 1, 4, 2, 0};
+            Timer t1 = {"T1", true, 0x4F, 0x4E, 0x4C, 0x4A, 0x48, 0x59, 0x58, 0, 3, 0, 4, div01, 0, 1, 0, 0x40, 0x20, 0x80, 0x44};
+            tm[0] = t0; tm[1] = t1;
+        }
         flash.assign(FLASH_WORDS, 0xFFFF);
         ram.assign(RAM_END, 0);
         touched.assign(RAM_END, 0);
         memset(eeprom, 0xFF, sizeof eeprom);
-        for (int i = 0; i < NPINS; i++) { ext[i] = -1; plog[i].resize(PLOG); }
+        for (int i = 0; i < MAX_PINS; i++) { ext[i] = -1; plog[i].resize(PLOG); }
         bpw.assign(FLASH_WORDS, 0);
         reset(0x01, true);
     }
@@ -210,14 +296,14 @@ public:
     void reset(uint8_t mcusr, bool hard) {
         std::fill(ram.begin(), ram.end(), 0);
         std::fill(touched.begin(), touched.end(), 0);
-        ram[SPL] = (RAM_END - 1) & 0xFF; ram[SPH] = (RAM_END - 1) >> 8;
+        ram[SPL] = (RAM_END - 1) & 0xFF; if (mcu->has_sph) ram[SPH] = (RAM_END - 1) >> 8;
         min_sp = RAM_END - 1;
-        ram[UCSR0A] = 0x20; ram[UCSR0C] = 0x06;
-        ram[TWSR] = 0xF8;
-        ram[MCUSR] = mcusr;
+        ram[mcu->ucsra] = 0x20; ram[mcu->ucsrc] = 0x06;
+        if (mcu->type == MCU_ATMEGA328P) ram[TWSR] = 0xF8;
+        ram[mcu->mcusr] = mcusr;
         pc = 0; sleeping = irq_inhibit = false;
         if (hard) last_user_pc = -1;
-        for (int i = 0; i < 3; i++) { tm[i].pre = 0; tm[i].dir = 1; tm[i].oc = 0; }
+        for (int i = 0; i < mcu->num_timers; i++) { tm[i].pre = 0; tm[i].dir = 1; tm[i].oc = 0; }
         us = decltype(us)();
         rxq.clear();
         adc_cnt = 0; adc_first = true; ee_busy = 0; wdt_cnt = 0;
@@ -293,7 +379,7 @@ public:
                 p += 11 + 2 * cnt;
             }
         } else {
-            if (buf.size() > img.size()) { err = strf("image too large (%zu > 32768 bytes)", buf.size()); return false; }
+            if (buf.size() > img.size()) { err = strf("image too large (%zu > %d bytes)", buf.size(), FLASH_WORDS * 2); return false; }
             std::copy(buf.begin(), buf.end(), img.begin());
             top = (int)buf.size();
         }
@@ -312,34 +398,36 @@ public:
     uint8_t port_level(int p) const {
         uint8_t ddr = ram[A_DDR(p)], port = ram[A_PORT(p)];
         uint8_t outm = ddr, outv = (port & ~ovr_mask[p]) | (ovr_val[p] & ovr_mask[p]);
-        if (p == 2 && (ram[UCSR0B] & 0x08)) outm |= 2;
+        if (p == 2 && (ram[mcu->ucsrb] & 0x08)) outm |= 2;
         uint8_t em = 0, ev = 0;
         for (int b = 0; b < 8; b++) {
             int i = port_pin(p, b);
             if (i >= 0 && ext[i] >= 0) { em |= 1 << b; if (ext[i]) ev |= 1 << b; }
         }
-        uint8_t pu = (ram[MCUCR] & 0x10) ? 0 : port;
+        uint8_t pu = (ram[MCUCR] & (mcu->type == MCU_ATMEGA328P ? 0x10 : 0x80)) ? 0 : port; // PUD
         uint8_t inv = (ev & em) | (pu & ~em);
-        if (p == 2 && (ram[UCSR0B] & 0x10) && !(em & 1)) inv |= 1; // RX idles high
+        if (p == 2 && (ram[mcu->ucsrb] & 0x10) && !(em & 1)) inv |= 1; // RX idles high
         return (outv & outm) | (inv & ~outm);
     }
 
     void pins_changed() {
         static const uint8_t msk[3] = {PCMSK0, PCMSK1, PCMSK2};
+        bool tiny = mcu->type == MCU_ATTINY2313; // PCMSK 0x40 (port B), GIMSK 0x5B, EIFR 0x5A; ISC bits in MCUCR
         for (int p = 0; p < 3; p++) {
             uint8_t n = port_level(p), ch = n ^ lv[p];
             if (!ch) continue;
             lv[p] = n;
             for (int b = 0; b < 8; b++)
                 if (ch & (1 << b)) { int i = port_pin(p, b); if (i >= 0) plog_push(i, (n >> b) & 1); }
-            if ((ch & ram[msk[p]]) && (ram[PCICR] & (1 << p))) ram[PCIFR] |= 1 << p;
+            if (tiny) { if (p == 0 && (ch & ram[0x40]) && (ram[0x5B] & 0x20)) ram[0x5A] |= 0x20; }
+            else if ((ch & ram[msk[p]]) && (ram[PCICR] & (1 << p))) ram[PCIFR] |= 1 << p;
             if (p == 2)
                 for (int k = 0; k < 2; k++) {
                     uint8_t bit = 4 << k;
                     if (!(ch & bit)) continue;
-                    int isc = (ram[EICRA] >> (2 * k)) & 3;
+                    int isc = (ram[tiny ? MCUCR : EICRA] >> (2 * k)) & 3;
                     bool rising = n & bit;
-                    if (isc == 1 || (isc == 2 && !rising) || (isc == 3 && rising)) ram[EIFR] |= 1 << k;
+                    if (isc == 1 || (isc == 2 && !rising) || (isc == 3 && rising)) ram[tiny ? 0x5A : EIFR] |= tiny ? 0x40 << k : 1 << k;
                 }
         }
     }
@@ -364,7 +452,7 @@ public:
             static const uint8_t kinds[16] = {K_NORMAL, K_PC, K_PC, K_PC, K_CTC, K_FAST, K_FAST, K_FAST,
                                               K_PC, K_PC, K_PC, K_PC, K_CTC, K_NORMAL, K_FAST, K_FAST};
             int w = (a & 3) | ((b >> 1) & 0xC);
-            uint16_t ocra = r16(t.ocra), icr = r16(ICR1L);
+            uint16_t ocra = r16(t.ocra), icr = t.icr ? r16(t.icr) : 0;
             const uint16_t tops[16] = {0xFFFF, 0xFF, 0x1FF, 0x3FF, ocra, 0xFF, 0x1FF, 0x3FF,
                                        icr, ocra, icr, ocra, icr, 0xFFFF, icr, ocra};
             kind = kinds[w];
@@ -386,7 +474,7 @@ public:
     }
 
     void compare_match(Timer &t, int ch, int kind, bool up, bool toc) {
-        ram[t.tifr] |= ch ? 4 : 2;
+        ram[t.tifr] |= ch ? t.flag_b : t.flag_a;
         int com = (ram[t.tccra] >> (ch ? 4 : 6)) & 3;
         if (!com) return;
         if (kind <= K_CTC) oc_set(t, ch, com == 1 ? 2 : com == 2 ? 0 : 1);
@@ -406,16 +494,16 @@ public:
         if (kind == K_PC) {
             if (top == 0) cnt = 0;
             else if (t.dir >= 0) { cnt++; if (cnt >= top) { cnt = top; t.dir = -1; } }
-            else { cnt--; if (cnt == 0) { t.dir = 1; ram[t.tifr] |= 1; } }
+            else { cnt--; if (cnt == 0) { t.dir = 1; ram[t.tifr] |= t.flag_ovf; } }
         } else if (cnt == top) {
             cnt = 0;
-            if (kind != K_CTC || top == max) ram[t.tifr] |= 1;
+            if (kind != K_CTC || top == max) ram[t.tifr] |= t.flag_ovf;
             if (kind == K_FAST)
                 for (int ch = 0; ch < 2; ch++) {
                     int com = (ram[t.tccra] >> (ch ? 4 : 6)) & 3;
                     if (com == 2) oc_set(t, ch, 1); else if (com == 3) oc_set(t, ch, 0);
                 }
-        } else if (cnt == max) { cnt = 0; ram[t.tifr] |= 1; }
+        } else if (cnt == max) { cnt = 0; ram[t.tifr] |= t.flag_ovf; }
         else cnt++;
         if (t.wide) w16(t.tcnt, cnt); else ram[t.tcnt] = (uint8_t)cnt;
     }
@@ -440,17 +528,17 @@ public:
 
     void update_overrides() {
         uint8_t m[3] = {0, 0, 0};
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < mcu->num_timers; i++)
             for (int ch = 0; ch < 2; ch++)
                 if (oc_connected(tm[i], ch)) m[ch ? tm[i].pb : tm[i].pa] |= 1 << (ch ? tm[i].bb : tm[i].ba);
-        if (ram[UCSR0B] & 0x08) m[2] |= 2;
+        if (ram[mcu->ucsrb] & 0x08) m[2] |= 2;
         memcpy(ovr_mask, m, 3);
     }
 
     // ================================================================= usart
     int32_t uart_bitcyc() const {
-        int ubrr = ((ram[UBRR0H] & 0xF) << 8) | ram[UBRR0L];
-        return (ram[UCSR0A] & 2 ? 8 : 16) * (ubrr + 1);
+        int ubrr = ((ram[mcu->ubrrh] & 0xF) << 8) | ram[mcu->ubrrl];
+        return (ram[mcu->ucsra] & 2 ? 8 : 16) * (ubrr + 1);
     }
     double baud() const { return F_CPU / uart_bitcyc(); }
     void tx_line(int l) {
@@ -463,9 +551,9 @@ public:
         us.cnt = uart_bitcyc(); us.shifting = true; tx_line(0);
     }
     void uart_write(uint8_t v) {
-        if (!(ram[UCSR0B] & 0x08)) return;
+        if (!(ram[mcu->ucsrb] & 0x08)) return;
         if (!us.shifting) uart_start(v);
-        else if (!us.txfull) { us.txbuf = v; us.txfull = true; ram[UCSR0A] &= ~0x20; }
+        else if (!us.txfull) { us.txbuf = v; us.txfull = true; ram[mcu->ucsra] &= ~0x20; }
     }
     void uart_tick(int c) {
         if (us.shifting) {
@@ -477,16 +565,16 @@ public:
                     us.txn++;
                     if (us.txfull) {
                         int32_t rem = us.cnt;
-                        us.txfull = false; ram[UCSR0A] |= 0x20;
+                        us.txfull = false; ram[mcu->ucsra] |= 0x20;
                         uart_start(us.txbuf);
                         us.cnt += rem;
-                    } else { us.shifting = false; ram[UCSR0A] |= 0x40; tx_line(1); }
+                    } else { us.shifting = false; ram[mcu->ucsra] |= 0x40; tx_line(1); }
                 } else { tx_line(us.sh & 1); us.cnt += uart_bitcyc(); }
             }
         }
-        if (!rxq.empty() && (ram[UCSR0B] & 0x10) && !(ram[UCSR0A] & 0x80) && cycles >= us.rxnext) {
+        if (!rxq.empty() && (ram[mcu->ucsrb] & 0x10) && !(ram[mcu->ucsra] & 0x80) && cycles >= us.rxnext) {
             us.rxd = rxq.front(); rxq.pop_front();
-            ram[UCSR0A] |= 0x80;
+            ram[mcu->ucsra] |= 0x80;
             us.rxnext = cycles + 10 * uart_bitcyc();
             us.rxn++;
         }
@@ -523,18 +611,18 @@ public:
 
     // ================================================================ eeprom
     void ee_write(uint8_t v) {
-        uint8_t o = ram[EECR], n = (o & 0x02) | (v & 0x38);
-        uint16_t a = (ram[EEARL] | ram[EEARH] << 8) & (EE_SIZE - 1);
+        uint8_t o = ram[mcu->eecr], n = (o & 0x02) | (v & 0x38);
+        uint16_t a = (ram[mcu->eearl] | (mcu->eearh ? ram[mcu->eearh] << 8 : 0)) & (mcu->ee_size - 1);
         if (v & 0x04) { n |= 0x04; ee_mpe_until = cycles + 4; }
         if ((v & 0x02) && (o & 0x04) && !(o & 0x02) && cycles <= ee_mpe_until) {
             int mode = (n >> 4) & 3;
-            eeprom[a] = mode == 0 ? ram[EEDR] : mode == 1 ? 0xFF : (eeprom[a] & ram[EEDR]);
+            eeprom[a] = mode == 0 ? ram[mcu->eedr] : mode == 1 ? 0xFF : (eeprom[a] & ram[mcu->eedr]);
             n = (n | 0x02) & ~0x04;
-            ee_busy = 54400; // 3.4 ms
+            ee_busy = (int32_t)(F_CPU * 0.0034); // 3.4 ms
             ee_writes++;
         }
-        if (v & 0x01) ram[EEDR] = eeprom[a];
-        ram[EECR] = n;
+        if (v & 0x01) ram[mcu->eedr] = eeprom[a];
+        ram[mcu->eecr] = n;
     }
 
     // =================================================================== twi
@@ -552,10 +640,12 @@ public:
 
     // ============================================================ io access
     static bool w1c(uint16_t a) {
+        if (mcu->type == MCU_ATTINY2313) return a == 0x36 || a == 0x39 || a == 0x30 || a == 0x58 || a == 0x5A;
         return a == PINB || a == PINC || a == PIND || a == TIFR0 || a == TIFR1 || a == TIFR2 || a == PCIFR || a == EIFR;
     }
 
     uint8_t io_read(uint16_t a) {
+        if (mcu->type == MCU_ATTINY2313) return io_read_2313(a);
         switch (a) {
         case PINB: return lv[0];
         case PINC: return lv[1];
@@ -569,6 +659,7 @@ public:
     }
 
     void io_write(uint16_t a, uint8_t v) {
+        if (mcu->type == MCU_ATTINY2313) { io_write_2313(a, v); return; }
         switch (a) {
         case PINB: case PINC: case PIND: ram[a + 2] ^= v; pins_changed(); return;
         case DDRB: case PORTB: case DDRC: case PORTC: case DDRD: case PORTD: case MCUCR:
@@ -598,27 +689,65 @@ public:
         }
     }
 
+    // ATtiny2313: PINB 0x36, PINA 0x39, PIND 0x30 (DDR, PORT follow), TIFR 0x58, EIFR 0x5A, UDR 0x2C
+    uint8_t io_read_2313(uint16_t a) {
+        switch (a) {
+        case 0x36: return lv[0];
+        case 0x39: return lv[1];
+        case 0x30: return lv[2];
+        case 0x4C: case 0x44: t16temp = ram[a + 1]; return ram[a]; // TCNT1L, ICR1L
+        case 0x4D: case 0x45: return t16temp;                      // TCNT1H, ICR1H
+        case 0x2C: ram[0x2B] &= ~0x80; return us.rxd;              // UDR
+        default: return ram[a];
+        }
+    }
+
+    void io_write_2313(uint16_t a, uint8_t v) {
+        switch (a) {
+        case 0x36: case 0x39: case 0x30: ram[a + 2] ^= v; pins_changed(); return; // PINx toggles PORTx
+        case 0x37: case 0x38: case 0x3A: case 0x3B: case 0x31: case 0x32: case MCUCR:
+            ram[a] = v; pins_changed(); return;
+        case 0x58: case 0x5A: ram[a] &= ~v; return;
+        case 0x50: case 0x53: case 0x4F: case 0x4E: // TCCR0A, TCCR0B, TCCR1A, TCCR1B
+            ram[a] = a == 0x53 ? (v & 0x0F) : v;
+            update_overrides(); pins_changed(); return;
+        case 0x4D: case 0x45: case 0x4B: case 0x49: t16temp = v; return;                       // TCNT1H, ICR1H, OCR1AH, OCR1BH
+        case 0x4C: case 0x44: case 0x4A: case 0x48: ram[a] = v; ram[a + 1] = t16temp; return; // their low bytes
+        case 0x2C: uart_write(v); return;
+        case 0x2B: { uint8_t o = (ram[a] & 0xFC) | (v & 3); if (v & 0x40) o &= ~0x40; ram[a] = o; return; }
+        case 0x2A: ram[a] = (v & ~0x02) | (ram[a] & 0x02); update_overrides(); pins_changed(); return;
+        case 0x3C: ee_write(v); return;
+        case 0x41: {
+            uint8_t n = (v & 0x7F) | (ram[a] & 0x80);
+            if (v & 0x80) n &= ~0x80;
+            ram[a] = n; wdt_cnt = 0; return;
+        }
+        case SPL: ram[a] = v; sp_written(); return;
+        default: ram[a] = v;
+        }
+    }
+
     inline uint8_t rd(uint16_t a) {
-        if (a < 0x20 || (a >= 0x100 && a < RAM_END)) return ram[a];
-        if (a < 0x100) return io_read(a);
+        if (a < 0x20 || (a >= SRAM_START && a < RAM_END)) return ram[a];
+        if (a < SRAM_START) return io_read(a);
         return 0;
     }
     inline void wr(uint16_t a, uint8_t v) {
         if (a < 0x20) ram[a] = v;
-        else if (a >= 0x100 && a < RAM_END) { ram[a] = v; touched[a] = 1; }
-        else if (a < 0x100) io_write(a, v);
+        else if (a >= SRAM_START && a < RAM_END) { ram[a] = v; touched[a] = 1; }
+        else if (a < SRAM_START) io_write(a, v);
     }
 
     // ============================================================ cpu helpers
     uint8_t &SREG() { return ram[SREG_A]; }
-    uint16_t sp() const { return ram[SPL] | (ram[SPH] << 8); }
-    void set_sp(uint16_t s) { ram[SPL] = s & 0xFF; ram[SPH] = s >> 8; if (s < min_sp) min_sp = s; }
+    uint16_t sp() const { return mcu->has_sph ? (ram[SPL] | (ram[SPH] << 8)) : ram[SPL]; }
+    void set_sp(uint16_t s) { ram[SPL] = s & 0xFF; if (mcu->has_sph) ram[SPH] = s >> 8; if (s < min_sp) min_sp = s; }
     // after a write to SPL/SPH: firmware built for the 328P sets SP to 0x08FF at startup; with --ram,
     // that becomes the real top so the stack and malloc() can use the extra RAM
     void sp_written() {
         uint16_t s = sp();
-        if (RAM_END > RAM_END_328P && s == RAM_END_328P - 1) { s = RAM_END - 1; ram[SPL] = s & 0xFF; ram[SPH] = s >> 8; }
-        if (s < min_sp && s >= 0x100) min_sp = s;
+        if (RAM_END > RAM_END_DEFAULT && s == RAM_END_DEFAULT - 1) { s = RAM_END - 1; ram[SPL] = s & 0xFF; ram[SPH] = s >> 8; }
+        if (s < min_sp && s >= SRAM_START) min_sp = s;
     }
     void push8(uint8_t v) { uint16_t s = sp(); wr(s, v); set_sp(s - 1); }
     uint8_t pop8() { uint16_t s = sp() + 1; set_sp(s); return rd(s); }
@@ -795,7 +924,7 @@ public:
                     } else switch (op) {
                         case 0x9508: npc = pop16(); cyc = 4; break;                                  // RET
                         case 0x9518: npc = pop16(); SREG() |= FI; irq_inhibit = true; cyc = 4; break; // RETI
-                        case 0x9588: { if (ram[SMCR] & 1) sleeping = true; } break;                      // SLEEP
+                        case 0x9588: { if (mcu->type == MCU_ATMEGA328P ? (ram[SMCR] & 1) : (ram[0x55] & 0x20)) sleeping = true; } break; // SLEEP
                         case 0x9598: paused = true; event = strf("BREAK instruction at 0x%04X", pc * 2); break;
                         case 0x95A8: wdt_cnt = 0; break;                                             // WDR
                         case 0x95C8: case 0x95D8: ram[0] = lpm(reg16(30)); cyc = 3; break;           // LPM
@@ -868,6 +997,7 @@ public:
 
     // ============================================================ interrupts
     int irq_pending() const {
+        if (mcu->type == MCU_ATTINY2313) return irq_pending_2313();
         if ((ram[EIMSK] & 1) && (((ram[EICRA] & 3) == 0) ? !(lv[2] & 4) : (ram[EIFR] & 1))) return 1;
         if ((ram[EIMSK] & 2) && ((((ram[EICRA] >> 2) & 3) == 0) ? !(lv[2] & 8) : (ram[EIFR] & 2))) return 2;
         uint8_t f = ram[PCIFR] & ram[PCICR];
@@ -899,9 +1029,37 @@ public:
         return 0;
     }
 
+    int irq_pending_2313() const {
+        if (ram[0x5B] & 0x40) { // INT0 (GIMSK bit 6)
+            int isc = ram[0x55] & 3;
+            if (isc == 0 ? !(lv[2] & 4) : (ram[0x5A] & 0x40)) return 1;
+        }
+        if (ram[0x5B] & 0x80) { // INT1 (GIMSK bit 7)
+            int isc = (ram[0x55] >> 2) & 3;
+            if (isc == 0 ? !(lv[2] & 8) : (ram[0x5A] & 0x80)) return 2;
+        }
+        if ((ram[0x59] & 0x08) && (ram[0x58] & 0x08)) return 3; // TIMER1_CAPT
+        if ((ram[0x59] & 0x40) && (ram[0x58] & 0x40)) return 4; // TIMER1_COMPA
+        if ((ram[0x59] & 0x80) && (ram[0x58] & 0x80)) return 5; // TIMER1_OVF
+        if ((ram[0x59] & 0x02) && (ram[0x58] & 0x02)) return 6; // TIMER0_OVF
+        uint8_t a = ram[0x2B], b = ram[0x2A]; // UCSRA, UCSRB
+        if ((a & 0x80) && (b & 0x80)) return 7; // USART_RX
+        if ((a & 0x20) && (b & 0x20)) return 8; // USART_UDRE
+        if ((a & 0x40) && (b & 0x40)) return 9; // USART_TX
+        if ((ram[0x28] & 0x08) && (ram[0x28] & 0x10)) return 10; // ANALOG_COMP
+        if ((ram[0x5B] & 0x20) && (ram[0x5A] & 0x20)) return 11; // PCINT
+        if ((ram[0x59] & 0x20) && (ram[0x58] & 0x20)) return 12; // TIMER1_COMPB
+        if ((ram[0x59] & 0x01) && (ram[0x58] & 0x01)) return 13; // TIMER0_COMPA
+        if ((ram[0x59] & 0x04) && (ram[0x58] & 0x04)) return 14; // TIMER0_COMPB
+        if ((ram[0x3C] & 0x08) && !(ram[0x3C] & 0x02)) return 17; // EE_READY
+        if ((ram[0x41] & 0xC0) == 0xC0) return 18; // WDT_OVERFLOW
+        return 0;
+    }
+
     void take_irq(int v) {
         static const uint8_t tbit[] = {2, 4, 1, 0x20, 2, 4, 1, 2, 4, 1};
-        if (v <= 2) { if ((ram[EICRA] >> (2 * (v - 1))) & 3) ram[EIFR] &= ~(1 << (v - 1)); }
+        if (mcu->type == MCU_ATTINY2313) clear_irq_2313(v);
+        else if (v <= 2) { if ((ram[EICRA] >> (2 * (v - 1))) & 3) ram[EIFR] &= ~(1 << (v - 1)); }
         else if (v <= 5) ram[PCIFR] &= ~(1 << (v - 3));
         else if (v == 6) { ram[WDTCSR] &= ~0x80; if (ram[WDTCSR] & 0x08) ram[WDTCSR] &= ~0x40; }
         else if (v <= 9) ram[TIFR2] &= ~tbit[v - 7];
@@ -912,27 +1070,43 @@ public:
         else if (v == 21) ram[ADCSRA] &= ~0x10;
         push16(pc);
         SREG() &= ~FI;
-        pc = v * 2;
+        pc = mcu->type == MCU_ATTINY2313 ? v : v * 2; // a vector is 1 word (RJMP) on the ATtiny, 2 (JMP) on the 328P
         irq_count[v]++;
         last_irq = v;
+    }
+
+    void clear_irq_2313(int v) {
+        if (v == 1) { if (ram[0x55] & 3) ram[0x5A] &= ~0x40; } // INTF0
+        else if (v == 2) { if (ram[0x55] & 0x0C) ram[0x5A] &= ~0x80; } // INTF1
+        else if (v == 3) ram[0x58] &= ~0x08; // ICF1
+        else if (v == 4) ram[0x58] &= ~0x40; // OCF1A
+        else if (v == 5) ram[0x58] &= ~0x80; // TOV1
+        else if (v == 6) ram[0x58] &= ~0x02; // TOV0
+        else if (v == 9) ram[0x2B] &= ~0x40; // TXC in UCSRA
+        else if (v == 10) ram[0x28] &= ~0x10; // ACI in ACSR
+        else if (v == 11) ram[0x5A] &= ~0x20; // PCIF in EIFR
+        else if (v == 12) ram[0x58] &= ~0x20; // OCF1B
+        else if (v == 13) ram[0x58] &= ~0x01; // OCF0A
+        else if (v == 14) ram[0x58] &= ~0x04; // OCF0B
+        else if (v == 18) { ram[0x41] &= ~0x80; if (ram[0x41] & 0x08) ram[0x41] &= ~0x40; } // WDT
     }
 
     // ================================================================= clock
     void tick(int c) {
         cycles += c;
-        for (int i = 0; i < 3; i++) timer_run(tm[i], c);
+        for (int i = 0; i < mcu->num_timers; i++) timer_run(tm[i], c);
         if (us.shifting || !rxq.empty()) uart_tick(c);
-        if (adc_cnt > 0) adc_tick(c);
-        if (ee_busy > 0 && (ee_busy -= c) <= 0) { ee_busy = 0; ram[EECR] &= ~0x02; }
-        if ((ram[EECR] & 0x04) && cycles > ee_mpe_until) ram[EECR] &= ~0x04;
-        uint8_t w = ram[WDTCSR];
+        if (mcu->has_adc && adc_cnt > 0) adc_tick(c);
+        if (ee_busy > 0 && (ee_busy -= c) <= 0) { ee_busy = 0; ram[mcu->eecr] &= ~0x02; }
+        if ((ram[mcu->eecr] & 0x04) && cycles > ee_mpe_until) ram[mcu->eecr] &= ~0x04;
+        uint8_t w = ram[mcu->wdtcsr];
         if (w & 0x48) {
             wdt_cnt += c;
             int p = (w & 7) | ((w >> 2) & 8);
             if (p > 9) p = 9;
-            if (wdt_cnt >= (uint64_t)2048 * 125 << p) {
+            if (wdt_cnt >= (uint64_t)(F_CPU * 0.016) << p) { // 2048 cycles of the 128 kHz oscillator
                 wdt_cnt = 0;
-                if (w & 0x40) ram[WDTCSR] |= 0x80;
+                if (w & 0x40) ram[mcu->wdtcsr] |= 0x80;
                 else { reset(0x08, false); event = "watchdog reset"; }
             }
         }
@@ -1044,13 +1218,13 @@ public:
 
     std::string pin_mode(int i) const {
         int p = pin_port(i), b = pin_bit(i);
-        uint8_t m = 1 << b;
-        if (i == 1 && (ram[UCSR0B] & 0x08)) return "TX";
-        if (i == 0 && (ram[UCSR0B] & 0x10)) return "RX";
+        uint8_t m = 1 << b, pud = mcu->type == MCU_ATMEGA328P ? 0x10 : 0x80;
+        if (i == 1 && (ram[mcu->ucsrb] & 0x08)) return "TX";
+        if (i == 0 && (ram[mcu->ucsrb] & 0x10)) return "RX";
         if (pwm_active(i)) return "PWM";
         if (ram[A_DDR(p)] & m) return "OUT";
-        if (i >= 14 && (ram[ADCSRA] & 0x80) && (ram[ADMUX] & 0xF) == i - 14) return "ADC";
-        if (ram[A_PORT(p)] & m && !(ram[MCUCR] & 0x10)) return "IN_PU";
+        if (mcu->has_adc && i >= 14 && (ram[ADCSRA] & 0x80) && (ram[ADMUX] & 0xF) == i - 14) return "ADC";
+        if (ram[A_PORT(p)] & m && !(ram[MCUCR] & pud)) return "IN_PU";
         return "IN";
     }
 };
@@ -1806,8 +1980,8 @@ public:
         return m.level(pin) ? K_INHI : K_IN;
     }
 
-    void draw_header(int y, int x0, int sp, const HPin *h, int lblrow, int pinrow, int valrow, bool top) {
-        for (int i = 0; i < 15; i++) {
+    void draw_header(int y, int x0, int sp, const HPin *h, int n_pins, int lblrow, int pinrow, int valrow, bool top) {
+        for (int i = 0; i < n_pins; i++) {
             int px = x0 + i * sp, pin = h[i].pin;
             int k = pin_kind(pin);
             const char *glyph = (pin >= 0 && m.level(pin)) ? "●" : (pin >= 0 ? "○" : "■");
@@ -1816,20 +1990,25 @@ public:
             int len = strlen(h[i].lbl);
             put(lblrow, px - (len - 1) / 2, len, COLOR_PAIR(kp(k, false)) | (pin == sel ? A_REVERSE : 0), h[i].lbl);
             std::string v;
-            if (!top && (pin >= 14 || pin <= -10)) {
+            if (!top && (pin >= 14 || pin <= -10) && mcu->has_adc) {
                 int ch = pin >= 14 ? pin - 14 : (pin == -10 ? 6 : 7);
                 v = strf("%.1fV", m.adcv[ch] * 5.0 / 1023);
-            } else if (pin >= 0 && m.pwm_active(pin)) {
-                double f, du;
-                m.measure(pin, m.cycles > 160000 ? m.cycles - 160000 : 0, m.cycles, f, du);
-                v = strf("%d%%", (int)lround(du * 100));
             } else if (pin == 0 || pin == 1) v = pin ? "TX" : "RX";
+            else if (pin >= 0) { // duty over the last 100 ms, on a PWM pin or any pin that toggled in that time
+                uint64_t win = (uint64_t)(F_CPU / 10), t0 = m.cycles > win ? m.cycles - win : 0;
+                if (m.pwm_active(pin) || m.log_idx(pin, t0) != m.log_idx(pin, m.cycles)) {
+                    double f, du;
+                    m.measure(pin, t0, m.cycles, f, du);
+                    v = strf("%d%%", (int)lround(du * 100));
+                }
+            }
             if (!v.empty()) put(valrow, px - ((int)v.size() - 1) / 2, sp, COLOR_PAIR(kp(pin_kind(pin), false)) | A_DIM, v);
         }
     }
 
     void draw_board(int y, int x, int w, int h) {
-        box_at(y, x, h, w, "ARDUINO NANO  ATmega328P @ 16 MHz");
+        if (mcu->type == MCU_ATTINY2313) { draw_dip(y, x, w, h); return; }
+        box_at(y, x, h, w, strf("ARDUINO NANO  ATmega328P @ %g MHz", F_CPU / 1e6));
         int sp = std::max(3, std::min(5, (w - 14) / 15));
         int bw = 15 * sp + 4;
         int bx = x + (w - bw) / 2 + 2;
@@ -1844,7 +2023,7 @@ public:
         put(by + 4, cx, 14, COLOR_PAIR(C_CHIP), "              ");
         put(by + 5, cx, 14, COLOR_PAIR(C_CHIP) | A_BOLD, "  ATMEGA328P  ");
         put(by + 6, cx, 14, COLOR_PAIR(C_CHIP), " o            ");
-        put(by + 4, cx - 9, 7, COLOR_PAIR(C_CHIP), "[16MHz]");
+        put(by + 4, cx - 9, 7, COLOR_PAIR(C_CHIP), strf("[%gMHz]", F_CPU / 1e6));
         // LEDs
         bool L = m.level(13);
         bool tx = now - led_tx < 0.06, rx = now - led_rx < 0.06;
@@ -1864,19 +2043,49 @@ public:
         for (int r = 0; r < 3; r++) uput(by + 4 + r, bx + bw - 6, COLOR_PAIR(kp(K_DIM, true)), "○ ○");
         put(by + 3, bx + bw - 6, 4, COLOR_PAIR(C_PCB), "ICSP");
         // headers
-        draw_header(by + 1, px0, sp, TOP_HDR, by + 1, by + 2, by, true);
-        draw_header(by + 9, px0, sp, BOT_HDR, by + 9, by + 8, by + 10, false);
-        // legend
-        int ly = by + 11;
-        if (ly < y + h - 1) {
-            int lx = x + 2;
-            const struct { int k; const char *t; } lg[] = {{K_HI, "out HIGH"}, {K_LO, "out LOW"}, {K_PWM, "PWM"}, {K_INHI, "in HIGH"}, {K_IN, "in LOW"}, {K_SER, "UART"}};
-            for (int i = 0; i < 6; i++) {
-                uput(ly, lx, COLOR_PAIR(kp(lg[i].k, false)) | A_BOLD, "●");
-                put(ly, lx + 2, 10, COLOR_PAIR(C_DIMTXT), lg[i].t);
-                lx += strlen(lg[i].t) + 4;
-            }
+        draw_header(by + 1, px0, sp, TOP_HDR, 15, by + 1, by + 2, by, true);
+        draw_header(by + 9, px0, sp, BOT_HDR, 15, by + 9, by + 8, by + 10, false);
+        draw_legend(by + 11, x, y + h - 1);
+    }
+
+    void draw_legend(int ly, int x, int ybottom) {
+        if (ly >= ybottom) return;
+        int lx = x + 2;
+        const struct { int k; const char *t; } lg[] = {{K_HI, "out HIGH"}, {K_LO, "out LOW"}, {K_PWM, "PWM"}, {K_INHI, "in HIGH"}, {K_IN, "in LOW"}, {K_SER, "UART"}};
+        for (int i = 0; i < 6; i++) {
+            uput(ly, lx, COLOR_PAIR(kp(lg[i].k, false)) | A_BOLD, "●");
+            put(ly, lx + 2, 10, COLOR_PAIR(C_DIMTXT), lg[i].t);
+            lx += strlen(lg[i].t) + 4;
         }
+    }
+
+    // ATtiny2313: the 20-pin DIP, pin 1 top left
+    void draw_dip(int y, int x, int w, int h) {
+        box_at(y, x, h, w, strf("%s  20-DIP @ %g MHz", mcu->display_name, F_CPU / 1e6));
+        int sp = std::max(4, std::min(7, (w - 14) / 12));
+        int bw = 10 * sp + 4;
+        int bx = x + (w - bw) / 2 + 1;
+        int px0 = bx + 3;
+        int by = y + 1;
+        for (int r = 0; r < 5; r++) put(by + 3 + r, bx, bw, COLOR_PAIR(C_CHIP), std::string(bw, ' '));
+        put(by + 5, bx, 3, COLOR_PAIR(C_CHIP), "( )"); // notch
+        std::string label = mcu->display_name;
+        for (size_t i = 0; i < label.size(); i++) label[i] = toupper((unsigned char)label[i]);
+        int cx = bx + bw / 2 - (int)label.size() / 2;
+        put(by + 5, cx, (int)label.size(), COLOR_PAIR(C_CHIP) | A_BOLD, label);
+        put(by + 4, cx - 4, 12, COLOR_PAIR(C_CHIP), strf("[%gMHz]", F_CPU / 1e6));
+        bool tx = now - led_tx < 0.06, rx = now - led_rx < 0.06;
+        put(by + 6, bx + 4, 2, COLOR_PAIR(tx ? C_LEDON : C_LEDOFF), "  ");
+        put(by + 6, bx + 7, 2, COLOR_PAIR(C_CHIP), "TX");
+        put(by + 6, bx + 10, 2, COLOR_PAIR(rx ? C_LEDON : C_LEDOFF), "  ");
+        put(by + 6, bx + 13, 2, COLOR_PAIR(C_CHIP), "RX");
+        static const HPin TOP[10] = {{"PA2", 17}, {"PD0", 0}, {"PD1", 1}, {"PA1", 16}, {"PA0", 15},
+                                     {"PD2", 2}, {"PD3", 3}, {"PD4", 4}, {"PD5", 5}, {"GND", -1}}; // pins 1..10
+        static const HPin BOT[10] = {{"VCC", -5}, {"PB7", 14}, {"PB6", 13}, {"PB5", 12}, {"PB4", 11},
+                                     {"PB3", 10}, {"PB2", 9}, {"PB1", 8}, {"PB0", 7}, {"PD6", 6}}; // pins 20..11
+        draw_header(by + 2, px0, sp, TOP, 10, by + 1, by + 2, by, true);
+        draw_header(by + 8, px0, sp, BOT, 10, by + 9, by + 8, by + 10, false);
+        draw_legend(by + 11, x, y + h - 1);
     }
 
     // name used in source for a symbol: "loop()::count" -> "count", "count.0" -> "count"
@@ -1982,7 +2191,7 @@ public:
         std::string pr = mode == SERIAL ? "> " + input + "_" : "  i: type to serial   ESC: stop typing   c: clear";
         put(y + h - 2, x + 1, iw, mode == SERIAL ? (COLOR_PAIR(C_WARN) | A_BOLD) : COLOR_PAIR(C_DIMTXT), pr);
     }
-    double ram_baud() { return (m.ram[UCSR0B] & 0x18) ? m.baud() : 0; }
+    double ram_baud() { return (m.ram[mcu->ucsrb] & 0x18) ? m.baud() : 0; }
 
     void draw_cpu(int y, int x, int w, int h) {
         box_at(y, x, 9, w, "CPU");
@@ -2044,7 +2253,7 @@ public:
     MemInfo mem_info() const {
         MemInfo r;
         memset(&r, 0, sizeof r);
-        r.sram = RAM_END - 0x100;
+        r.sram = RAM_END - SRAM_START;
         r.sp = m.sp();
         r.stack = r.sp < (uint32_t)RAM_END ? (RAM_END - 1) - (int)r.sp : 0;
         r.peak = (RAM_END - 1) - m.min_sp;
@@ -2067,7 +2276,7 @@ public:
             r.avail = r.sp + 1 > r.heap_hi ? (int)(r.sp + 1 - r.heap_hi) : 0; // gap between the heap and the stack
         } else {
             int used = 0;
-            for (int a = 0x100; a < RAM_END; a++) used += (m.touched[a] || (uint32_t)a > r.sp);
+            for (int a = SRAM_START; a < RAM_END; a++) used += (m.touched[a] || (uint32_t)a > r.sp);
             r.used = used;
             r.avail = r.sram - used;
         }
@@ -2086,12 +2295,12 @@ public:
 
     int memory_height() const { return 10; }
     void draw_memory(int y, int x, int w, int h) {
-        bool test = RAM_END != RAM_END_328P || FLASH_WORDS != 16384;
+        bool test = RAM_END != RAM_END_DEFAULT || FLASH_WORDS != mcu->flash_words;
         int iw = w - 2, row = y + 1, last = y + h - 2;
         // block map of the SRAM, lowest address top-left; each cell is a few bytes
         const int cols = std::min(32, iw - 2);
         int rows = 2;
-        int sram = RAM_END - 0x100, bpc = (sram + cols * rows - 1) / (cols * rows);
+        int sram = RAM_END - SRAM_START, bpc = (sram + cols * rows - 1) / (cols * rows);
         box_at(y, x, h, w, test ? strf("MEMORY  test RAM %s ROM %s  %dB/cell", kb(sram).c_str(), kb(FLASH_WORDS * 2).c_str(), bpc)
                                 : strf("MEMORY  %dB/cell", bpc));
         MemInfo mi = mem_info();
@@ -2100,7 +2309,7 @@ public:
         static const int kcol[6] = {K_DIM, K_LO, K_INHI, K_IN, K_PWM, K_LO};
         for (int r = 0; r < rows && row <= last; r++, row++) {
             for (int c = 0; c < cols; c++) {
-                uint32_t a0 = 0x100 + (uint32_t)(r * cols + c) * bpc;
+                uint32_t a0 = SRAM_START + (uint32_t)(r * cols + c) * bpc;
                 if (a0 >= (uint32_t)RAM_END) break;
                 int cls = M_FREE;
                 for (uint32_t a = a0; a < a0 + bpc && a < (uint32_t)RAM_END; a++) cls = std::max(cls, mem_class(a, mi));
@@ -2144,8 +2353,8 @@ public:
         }
         if (row <= last) {
             int eu = 0;
-            for (int i = 0; i < EE_SIZE; i++) eu += m.eeprom[i] != 0xFF;
-            put(row++, x + 1, iw, COLOR_PAIR(C_DIMTXT), strf(" EEPROM %d/%d B used  writes %u", eu, EE_SIZE, m.ee_writes));
+            for (int i = 0; i < mcu->ee_size; i++) eu += m.eeprom[i] != 0xFF;
+            put(row++, x + 1, iw, COLOR_PAIR(C_DIMTXT), strf(" EEPROM %d/%d B used  writes %u", eu, mcu->ee_size, m.ee_writes));
         }
     }
 
@@ -2155,18 +2364,20 @@ public:
         int ph = std::min(h - 12 - memh, 25);
         if (ph < 5) ph = std::max(3, h - 3 - memh);
         box_at(y, x, ph, w, "PINS  \u2191\u2193 \u23CE \u2190\u2192  TAB", focus == F_PINS);
-        put(y + 1, x + 1, iw, COLOR_PAIR(C_DIMTXT) | A_UNDERLINE, " PIN  PRT MODE  LV DRV  ANALOG     ");
+        put(y + 1, x + 1, iw, COLOR_PAIR(C_DIMTXT) | A_UNDERLINE,
+            mcu->has_adc ? " PIN  PRT MODE  LV DRV  ANALOG     " : " PIN  PRT MODE  LV DRV             ");
         int vis = ph - 3, off = 0;
         if (sel >= vis) off = sel - vis + 1;
-        for (int r = 0; r < vis && r + off < 22; r++) {
+        int max_pins_display = mcu->has_adc ? mcu->npins + 2 : mcu->npins;
+        for (int r = 0; r < vis && r + off < max_pins_display; r++) {
             int i = r + off;
             std::string s;
             int k;
-            if (i < NPINS) {
+            if (i < mcu->npins) {
                 const char *drv = m.ext[i] < 0 ? " -" : m.ext[i] ? " H" : " L";
-                s = strf("%c%-4s P%c%d %-5s %d  %s", i == sel ? '>' : ' ', PIN_NAME[i], "BCD"[pin_port(i)], pin_bit(i),
+                s = strf("%c%-4s P%c%d %-5s %d  %s", i == sel ? '>' : ' ', mcu->pin_names[i], mcu->port_letters[pin_port(i)], pin_bit(i),
                          m.pin_mode(i).c_str(), m.level(i), drv);
-                if (i >= 14) s += strf("  %4d %.2fV", m.adcv[i - 14], m.adcv[i - 14] * 5.0 / 1023);
+                if (mcu->has_adc && i >= 14) s += strf("  %4d %.2fV", m.adcv[i - 14], m.adcv[i - 14] * 5.0 / 1023);
                 k = pin_kind(i);
             } else {
                 int ch = i - 14;
@@ -2184,7 +2395,7 @@ public:
         box_at(py, x, phh, w, "PERIPHERALS");
         std::vector<std::pair<std::string, int> > L;
         static const char *kn[4] = {"NORM", "CTC", "FPWM", "PCPWM"};
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < mcu->num_timers; i++) {
             const Nano::Timer &t = m.tm[i];
             int kind; uint16_t top; bool toc;
             m.timer_mode(t, kind, top, toc);
@@ -2194,18 +2405,27 @@ public:
             uint16_t oa = t.wide ? m.r16(t.ocra) : m.ram[t.ocra], ob = t.wide ? m.r16(t.ocrb) : m.ram[t.ocrb];
             L.push_back(std::make_pair(strf("%s %-5s %-5s C%-5u A%-5u B%u", t.name, kn[kind], pre.c_str(), cnt, oa, ob), cs ? 0 : A_DIM));
         }
-        uint8_t b = m.ram[UCSR0B];
-        L.push_back(std::make_pair(strf("UART %s%s %.0f baud%s", b & 8 ? "TX " : "", b & 0x10 ? "RX " : "", m.baud(), m.ram[UCSR0A] & 2 ? " U2X" : ""), (b & 0x18) ? 0 : A_DIM));
-        static const char *refs[4] = {"AREF", "AVCC", "?", "1V1"};
-        uint8_t ad = m.ram[ADCSRA];
-        L.push_back(std::make_pair(strf("ADC  %s mux %d ref %s%s", ad & 0x80 ? "on " : "off", m.ram[ADMUX] & 0xF, refs[m.ram[ADMUX] >> 6], ad & 0x40 ? " busy" : ""), ad & 0x80 ? 0 : A_DIM));
-        uint8_t wd = m.ram[WDTCSR];
+        uint8_t b = m.ram[mcu->ucsrb];
+        L.push_back(std::make_pair(strf("UART %s%s %.0f baud%s", b & 8 ? "TX " : "", b & 0x10 ? "RX " : "", m.baud(), m.ram[mcu->ucsra] & 2 ? " U2X" : ""), (b & 0x18) ? 0 : A_DIM));
+        if (mcu->has_adc) {
+            static const char *refs[4] = {"AREF", "AVCC", "?", "1V1"};
+            uint8_t ad = m.ram[ADCSRA];
+            L.push_back(std::make_pair(strf("ADC  %s mux %d ref %s%s", ad & 0x80 ? "on " : "off", m.ram[ADMUX] & 0xF, refs[m.ram[ADMUX] >> 6], ad & 0x40 ? " busy" : ""), ad & 0x80 ? 0 : A_DIM));
+        } else {
+            uint8_t ac = m.ram[0x28]; // ACSR
+            L.push_back(std::make_pair(strf("ACMP %s out %d", (ac & 0x80) ? "off" : "on", (ac >> 5) & 1), (ac & 0x80) ? A_DIM : 0));
+        }
+        uint8_t wd = m.ram[mcu->wdtcsr];
         L.push_back(std::make_pair(strf("EEPROM wr %u  WDT %s", m.ee_writes, wd & 0x48 ? strf("%s%s p%d", wd & 8 ? "R" : "", wd & 0x40 ? "I" : "", (wd & 7) | ((wd >> 2) & 8)).c_str() : "off"), 0));
-        L.push_back(std::make_pair(strf("SPI %s  TWI %s  SLEEP %s", m.ram[SPCR] & 0x40 ? "on" : "off", m.ram[TWCR] & 4 ? "on" : "off", m.ram[SMCR] & 1 ? "en" : "off"), A_DIM));
-        L.push_back(std::make_pair(strf("IRQ  I=%d last %s", (m.ram[SREG_A] >> 7) & 1, m.last_irq ? IRQ_NAMES[m.last_irq] : "-"), 0));
+        if (mcu->type == MCU_ATMEGA328P) {
+            L.push_back(std::make_pair(strf("SPI %s  TWI %s  SLEEP %s", m.ram[SPCR] & 0x40 ? "on" : "off", m.ram[TWCR] & 4 ? "on" : "off", m.ram[SMCR] & 1 ? "en" : "off"), A_DIM));
+        } else {
+            L.push_back(std::make_pair(strf("USI  %s  SLEEP %s", (m.ram[0x2D] & 0x30) ? "on" : "off", (m.ram[0x55] & 0x20) ? "en" : "off"), A_DIM));
+        }
+        L.push_back(std::make_pair(strf("IRQ  I=%d last %s", (m.ram[SREG_A] >> 7) & 1, m.last_irq ? mcu->irq_names[m.last_irq] : "-"), 0));
         std::string ic;
-        for (int v = 1; v < 26; v++)
-            if (m.irq_count[v]) ic += strf("%s:%llu ", IRQ_NAMES[v], (unsigned long long)m.irq_count[v]);
+        for (int v = 1; v < mcu->num_irqs; v++)
+            if (m.irq_count[v]) ic += strf("%s:%llu ", mcu->irq_names[v], (unsigned long long)m.irq_count[v]);
         while (!ic.empty()) {
             L.push_back(std::make_pair(" " + ic.substr(0, iw - 1), A_DIM));
             ic = ic.size() > (size_t)iw - 1 ? ic.substr(iw - 1) : "";
@@ -2213,7 +2433,7 @@ public:
         for (int i = 0; i < (int)L.size() && i < phh - 2; i++) put(py + 1 + i, x + 1, iw, L[i].second, " " + L[i].first);
     }
 
-    // Logic analyzer: all 20 digital pins, D0..D9 on the left half, D10..D13 and A0..A5 on the right,
+    // Logic analyzer: all digital pins (the Nano's D0..D9 on the left half, D10..D13 and A0..A5 on the right),
     // one row each. High is a raised bar, low a baseline, an edge a vertical bar, faster activity a shade.
     // Each label shows the pin, its mode, frequency, duty and average crest (high time); a box on the right
     // details the highlighted pin.
@@ -2232,12 +2452,12 @@ public:
         if (s < 1) return strf("%.0fms", s * 1e3);
         return strf("%.2fs", s);
     }
-    bool is_uart_pin(int i) const { return (i == 0 && (m.ram[UCSR0B] & 0x10)) || (i == 1 && (m.ram[UCSR0B] & 0x08)); }
+    bool is_uart_pin(int i) const { return (i == 0 && (m.ram[mcu->ucsrb] & 0x10)) || (i == 1 && (m.ram[mcu->ucsrb] & 0x08)); }
 
     void draw_pin_detail(int y, int x, int w, int h, int i, uint64_t t0, uint64_t tend) {
         int p = pin_port(i), b = pin_bit(i);
         std::string md = m.pin_mode(i);
-        box_at(y, x, h, w, strf("%s  P%c%d  %s", PIN_NAME[i], "BCD"[p], b, md.c_str()));
+        box_at(y, x, h, w, strf("%s  P%c%d  %s", mcu->pin_names[i], mcu->port_letters[p], b, md.c_str()));
         int iw = w - 2, row = y + 1, last = y + h - 2;
         auto line = [&](const std::string &k, const std::string &v, int attr) {
             if (row <= last) put(row++, x + 1, iw, attr, strf(" %-7s %s", k.c_str(), v.c_str()));
@@ -2248,7 +2468,7 @@ public:
                                                  : m.ram[A_DDR(p)] & (1 << b) ? "output" : m.ext[i] >= 0 ? "input, driven" : "input"), A_BOLD);
         if (is_uart_pin(i)) {
             int bc = m.uart_bitcyc();
-            line("baud", strf("%.0f  8N1%s", m.baud(), m.ram[UCSR0A] & 2 ? " U2X" : ""), 0);
+            line("baud", strf("%.0f  8N1%s", m.baud(), m.ram[mcu->ucsra] & 2 ? " U2X" : ""), 0);
             line("bit", fmt_time(bc / F_CPU) + strf("  byte %s", fmt_time(10 * bc / F_CPU).c_str()), 0);
             line("bytes", strf("TX %llu  RX %llu", (unsigned long long)m.us.txn, (unsigned long long)m.us.rxn), 0);
         } else {
@@ -2263,7 +2483,7 @@ public:
                            r.last_edge ? (fmt_dt((m.cycles - r.last_edge) / F_CPU) + " ago").c_str() : ("none in " + fmt_time(win)).c_str()),
              COLOR_PAIR(C_DIMTXT));
         // the timer behind a PWM pin, and the frequency its settings give
-        for (int t = 0; t < 3; t++)
+        for (int t = 0; t < mcu->num_timers; t++)
             for (int ch = 0; ch < 2; ch++) {
                 const Nano::Timer &tm = m.tm[t];
                 if ((ch ? tm.pb : tm.pa) != p || (ch ? tm.bb : tm.ba) != b || !m.oc_connected(tm, ch)) continue;
@@ -2285,7 +2505,7 @@ public:
     void draw_scope(int y, int x, int w, int h) {
         double us = TIMEBASES[tb_i];
         const int lw = 28;
-        bool detail = sel < NPINS && w >= 150 && h >= 8;
+        bool detail = sel < mcu->npins && w >= 150 && h >= 8;
         const int dw = 34;
         int cw = detail ? w - dw - 1 : w;      // width used by the channels
         int half = (cw - 2) / 2, tw = half - lw - 3;
@@ -2294,9 +2514,9 @@ public:
         uint64_t win = cpc * tw;
         uint64_t tend = m.cycles;
         std::string trig = "off";
-        if (trigger && sel < NPINS) {
+        if (trigger && sel < mcu->npins) {
             int p = sel;
-            trig = strf("%s rising", PIN_NAME[p]);
+            trig = strf("%s rising", mcu->pin_names[p]);
             uint64_t lim = tend > win * 9 / 10 ? tend - win * 9 / 10 : 0;
             uint64_t k = m.log_idx(p, lim), oldest = m.pcount[p] > PLOG ? m.pcount[p] - PLOG : 0;
             while (k > oldest) { k--; if (m.ev_lvl(p, k)) { tend = m.ev_cyc(p, k) + win * 9 / 10; break; } }
@@ -2312,17 +2532,17 @@ public:
         attron(COLOR_PAIR(C_BORDER) | A_DIM);
         mvvline(y + 1, x + 1 + half - 1, ACS_VLINE, rows + 1);
         attroff(COLOR_PAIR(C_BORDER) | A_DIM);
-        for (int i = 0; i < NPINS; i++) {
+        for (int i = 0; i < mcu->npins; i++) {
             int row = i % 10;
             if (row >= rows) continue;
             int bx = x + 1 + (i / 10) * half, ry = y + 1 + row;
             std::string md = m.pin_mode(i);
             int k = pin_kind(i);
             std::string lab;
-            if (is_uart_pin(i)) lab = strf("%-3s %-3s", PIN_NAME[i], short_mode(md)); // TX/RX: the detail box has the UART figures
+            if (is_uart_pin(i)) lab = strf("%-3s %-3s", mcu->pin_names[i], short_mode(md)); // TX/RX: the detail box has the UART figures
             else {
                 Nano::Pulses r = m.pulses(i, t0, tend);
-                lab = strf("%-3s %-3s %7s %3d%% %6s", PIN_NAME[i], short_mode(md), fmt_hz(r.freq).c_str(),
+                lab = strf("%-3s %-3s %7s %3d%% %6s", mcu->pin_names[i], short_mode(md), fmt_hz(r.freq).c_str(),
                            (int)lround(r.duty * 100), r.highs ? fmt_dt(r.hi_avg).c_str() : "-");
             }
             put(ry, bx, lw, i == sel ? (COLOR_PAIR(C_SEL) | A_BOLD) : (COLOR_PAIR(kp(k, false)) | A_BOLD), lab);
@@ -2367,7 +2587,8 @@ public:
         }
         // top bar
         std::string st = m.paused ? "⏸ PAUSED" : "▶ RUNNING";
-        std::string top = strf(" NANOEMU │ %s (%d bytes) │ %s │ speed %s │ %.0f%% realtime ",
+        std::string top = strf(" NANOEMU │ %s │ %s (%d bytes) │ %s │ speed %s │ %.0f%% realtime ",
+                               mcu->display_name,
                                fw_path.empty() ? "(no firmware)" : fw_path.c_str(), fw_size, st.c_str(),
                                SPEEDS[speed_i] ? strf("x%g", SPEEDS[speed_i]).c_str() : "max", rate / F_CPU * 100);
         attron(COLOR_PAIR(C_TITLE));
@@ -2469,9 +2690,9 @@ public:
         case '\t': focus = focus == F_PINS ? F_SCOPE : F_PINS; break;
         case 27: tcur = -1; break;
         case KEY_UP: case 'k': if (sel > 0) sel--; break;
-        case KEY_DOWN: case 'j': if (sel < (focus == F_SCOPE ? NPINS - 1 : 21)) sel++; break;
+        case KEY_DOWN: case 'j': if (sel < (focus == F_SCOPE ? mcu->npins - 1 : (mcu->has_adc ? mcu->npins + 1 : mcu->npins - 1))) sel++; break;
         case '\n': case '\r': case KEY_ENTER:
-            if (sel < NPINS) { m.ext[sel] = m.ext[sel] < 0 ? 1 : m.ext[sel] == 1 ? 0 : -1; m.pins_changed(); }
+            if (sel < mcu->npins) { m.ext[sel] = m.ext[sel] < 0 ? 1 : m.ext[sel] == 1 ? 0 : -1; m.pins_changed(); }
             break;
         case KEY_LEFT: case KEY_RIGHT: case 'h': case ',': case '.': {
             int dir = (ch == KEY_RIGHT || ch == '.') ? 1 : -1;
@@ -2505,7 +2726,7 @@ public:
             init_pair(C_TITLE, COLOR_BLACK, COLOR_CYAN);
             init_pair(C_SEL, COLOR_BLACK, COLOR_WHITE);
             init_pair(C_PCB, COLOR_WHITE, COLOR_BLUE);
-            init_pair(C_CHIP, COLOR_WHITE, COLOR_BLACK);
+            init_pair(C_CHIP, COLOR_WHITE, COLORS >= 256 ? 238 : COLORS >= 16 ? 8 : COLOR_BLACK); // dark gray body
             init_pair(C_USB, COLOR_BLACK, COLOR_WHITE);
             init_pair(C_LEDON, COLOR_BLACK, COLOR_YELLOW);
             init_pair(C_LEDOFF, COLOR_BLACK, COLOR_BLUE);
@@ -2578,10 +2799,11 @@ public:
                 mi.avail, mi.stack, mi.peak, mi.symbols ? strf(", data %d, bss %d, heap %d", mi.data, mi.bss, mi.heap).c_str() : "",
                 fw_size, FLASH_WORDS * 2 - BOOT_BYTES);
         fprintf(stderr, "--- pins:");
-        for (int i = 0; i < NPINS; i++) {
-            double f, d;
-            m.measure(i, m.cycles > 1600000 ? m.cycles - 1600000 : 0, m.cycles, f, d);
-            fprintf(stderr, " %s=%d%s", PIN_NAME[i], m.level(i), f > 0 ? strf("(%.0fHz,%d%%)", f, (int)lround(d * 100)).c_str() : "");
+        for (int i = 0; i < mcu->npins; i++) {
+            double f = 0, d = 0;
+            uint64_t win = (uint64_t)(F_CPU / 10);
+            m.measure(i, m.cycles > win ? m.cycles - win : 0, m.cycles, f, d);
+            fprintf(stderr, " %s=%d%s", mcu->pin_names[i], m.level(i), f > 0 ? strf("(%.0fHz,%d%%)", f, (int)lround(d * 100)).c_str() : "");
         }
         fprintf(stderr, "\n");
     }
@@ -2627,6 +2849,9 @@ volatile sig_atomic_t App::stop_req = 0;
 static void usage(const char *p) {
     fprintf(stderr,
             "usage: %s [options] firmware.{bin,hex,elf}\n"
+            "  --mcu TYPE   atmega328p (default) or attiny2313 (also for the attiny2313a);\n"
+            "               an .elf built for avr25 selects attiny2313 by itself\n"
+            "  --freq HZ    CPU clock, e.g. 20M, 8M or 16000000 (default 16M)\n"
             "  -c, --serial run without the TUI, in real time: serial TX to stdout, stdin to serial RX;\n"
             "               stops on Ctrl-C, a breakpoint, or after -H SECONDS\n"
             "  --speed X    with --serial: speed factor (1 = real time, 0 = as fast as possible)\n"
@@ -2649,12 +2874,34 @@ static long parse_size(const char *t) {
     return v;
 }
 
+// "20M", "20MHz", "8000k", "16000000" -> Hz
+static double parse_freq(const char *t) {
+    char *e = 0;
+    double v = strtod(t, &e);
+    if (e && (*e == 'm' || *e == 'M')) v *= 1e6;
+    else if (e && (*e == 'k' || *e == 'K')) v *= 1e3;
+    return v;
+}
+
+// The MCU an .elf was built for, from the machine field of e_flags: avr25 (ATtiny2313 and kin), else -1
+static int elf_mcu(const std::string &path) {
+    uint8_t h[40];
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) return -1;
+    size_t n = fread(h, 1, sizeof h, f);
+    fclose(f);
+    if (n < sizeof h || h[0] != 0x7F || h[1] != 'E' || h[2] != 'L' || h[3] != 'F') return -1;
+    return (h[36] & 0x7F) == 25 ? MCU_ATTINY2313 : -1;
+}
+
 int main(int argc, char **argv) {
     double hsecs = -1;
     std::string inject, file;
     std::vector<std::string> bps, dirs;
     bool start_paused = false, serial_only = false;
     double speed = 1, hold_speed = 0.0001;
+    int mcu_type = -1;
+    long ram = 0, flash = 0;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "-H" && i + 1 < argc) hsecs = atof(argv[++i]);
@@ -2665,19 +2912,30 @@ int main(int argc, char **argv) {
         else if (a == "-c" || a == "--serial") serial_only = true;
         else if (a == "--speed" && i + 1 < argc) speed = atof(argv[++i]);
         else if (a == "--hold-speed" && i + 1 < argc) hold_speed = atof(argv[++i]);
-        else if (a == "--ram" && i + 1 < argc) {
-            long v = parse_size(argv[++i]);
-            if (v < 2048 || v > 0xFF00 || v % 256) { fprintf(stderr, "--ram: 2048 to 65280 bytes, a multiple of 256 (e.g. 4096, 8K)\n"); return 1; }
-            RAM_END = 0x100 + (int)v;
-        } else if (a == "--flash" && i + 1 < argc) {
-            long v = parse_size(argv[++i]);
-            if (v != 32768 && v != 65536 && v != 131072) { fprintf(stderr, "--flash: 32K, 64K or 128K\n"); return 1; }
-            FLASH_WORDS = (int)(v / 2);
-            PC_MASK = FLASH_WORDS - 1;
+        else if (a == "--mcu" && i + 1 < argc) {
+            mcu_type = find_mcu(argv[++i]);
+            if (mcu_type < 0) { fprintf(stderr, "--mcu: atmega328p, attiny2313 or attiny2313a\n"); return 1; }
+        } else if (a == "--freq" && i + 1 < argc) {
+            F_CPU = parse_freq(argv[++i]);
+            if (F_CPU < 1e3 || F_CPU > 1e8) { fprintf(stderr, "--freq: a clock such as 20M, 8M or 16000000\n"); return 1; }
         }
+        else if (a == "--ram" && i + 1 < argc) ram = parse_size(argv[++i]);
+        else if (a == "--flash" && i + 1 < argc) flash = parse_size(argv[++i]);
         else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
         else if (a[0] == '-') { usage(argv[0]); return 1; }
         else file = a;
+    }
+    if (mcu_type < 0 && !file.empty()) mcu_type = elf_mcu(file);
+    set_mcu(mcu_type < 0 ? MCU_ATMEGA328P : (McuType)mcu_type);
+    if ((ram || flash) && mcu->type != MCU_ATMEGA328P) { fprintf(stderr, "--ram and --flash: ATmega328P only\n"); return 1; }
+    if (ram) {
+        if (ram < 2048 || ram > 0xFF00 || ram % 256) { fprintf(stderr, "--ram: 2048 to 65280 bytes, a multiple of 256 (e.g. 4096, 8K)\n"); return 1; }
+        RAM_END = 0x100 + (int)ram;
+    }
+    if (flash) {
+        if (flash != 32768 && flash != 65536 && flash != 131072) { fprintf(stderr, "--flash: 32K, 64K or 128K\n"); return 1; }
+        FLASH_WORDS = (int)(flash / 2);
+        PC_MASK = FLASH_WORDS - 1;
     }
     static App *papp = new App; // built after the sizes are known; large (pin logs), so on the heap
     App &app = *papp;
