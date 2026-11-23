@@ -1,6 +1,6 @@
 # nanoemu
 
-An **Arduino Nano (ATmega328P @ 16 MHz) emulator** with a full terminal UI. It's a single C++11 file with no dependencies beyond ncurses.
+An **Arduino Nano (ATmega328P @ 16 MHz) emulator** with a full terminal UI, which also runs the **ATtiny2313 / ATtiny2313A**. It's a single C++11 file with no dependencies beyond ncurses.
 
 ```
 ┌─ CPU ──────────┐┌─ ARDUINO NANO  ATmega328P @ 16 MHz ─────────────────┐┌─ PINS ──────────────┐
@@ -37,6 +37,7 @@ c++ -std=c++11 -O2 -o nanoemu nanoemu.cpp -lncurses
 ./nanoemu examples/asmtest/asmtest.hex
 ./nanoemu sketch.ino.bin          # raw flash image
 ./nanoemu sketch.ino.elf          # ELF from avr-gcc / arduino-cli
+./nanoemu --freq 20M firm.elf     # a CPU clock other than 16 MHz: the one the firmware was built for (F_CPU)
 ./nanoemu -b loop sketch.ino.elf  # source view + stop when loop() is reached
 ./nanoemu -b main.ino:42 -b 0x1a4 firm.elf   # breakpoints by file:line or byte address
 ./nanoemu --serial firm.hex       # no TUI: real time, serial ↔ stdin/stdout, Ctrl-C stops
@@ -45,6 +46,38 @@ c++ -std=c++11 -O2 -o nanoemu nanoemu.cpp -lncurses
 ```
 
 Use a terminal of at least 110×34. 180×50 or larger looks best.
+
+### ATtiny2313
+
+`--mcu attiny2313` runs the ATtiny2313; an `.elf` built for it (`-mmcu=attiny2313` or `attiny2313a`, the avr25
+family) selects it by itself. The ATtiny2313A runs on the same model: its extra pin-change vectors (port A and D)
+are not emulated. The board becomes the 20-pin DIP; 2 KB flash, 128 B SRAM, 128 B EEPROM, Timer0 and Timer1,
+USART, INT0/INT1, pin change on port B, EEPROM and watchdog. `--ram` and `--flash` are for the ATmega328P only.
+
+Pinout, with the names the PINS panel and the logic analyzer use (D0..D17) and what nanoemu emulates on each pin:
+
+```
+                  ┌───────┬─┬───────┐
+ PA2 (RESET) D17 ─┤ 1     └─┘    20 ├─ VCC
+ PD0 (RXD)   D0  ─┤ 2            19 ├─ D14 PB7 (SCK)
+ PD1 (TXD)   D1  ─┤ 3            18 ├─ D13 PB6 (MISO)
+ PA1 (XTAL2) D16 ─┤ 4            17 ├─ D12 PB5 (MOSI)
+ PA0 (XTAL1) D15 ─┤ 5   ATtiny   16 ├─ D11 PB4 (OC1B)
+ PD2 (INT0)  D2  ─┤ 6    2313    15 ├─ D10 PB3 (OC1A)
+ PD3 (INT1)  D3  ─┤ 7            14 ├─ D9  PB2 (OC0A)
+ PD4 (T0)    D4  ─┤ 8            13 ├─ D8  PB1 (AIN1)
+ PD5 (OC0B)  D5  ─┤ 9            12 ├─ D7  PB0 (AIN0)
+ GND             ─┤ 10           11 ├─ D6  PD6 (ICP)
+                  └─────────────────┘
+```
+
+Emulated: GPIO and pull-ups on every pin, the USART on PD0/PD1, INT0/INT1 on PD2/PD3, PWM output on OC0A, OC0B,
+OC1A and OC1B, and pin-change interrupts on PB0..PB7. The functions in parentheses that are not in that list
+(RESET, XTAL, T0, ICP, AIN, USI) are not emulated: those pins are plain GPIO. PA2 is the reset pin unless the
+RSTDISBL fuse is set; nanoemu treats it as GPIO.
+
+The clock stays 16 MHz unless `--freq` says otherwise, so pass the firmware's `F_CPU`: a 20 MHz build run at
+16 MHz has its delays, timers and baud rate 20 % slow (9600 baud shows as 7692).
 
 ### Keys
 
